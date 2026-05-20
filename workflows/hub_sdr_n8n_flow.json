@@ -1,0 +1,242 @@
+{
+  "name": "Hub SDR — Fluxo Principal",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hub-sdr/lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-webhook-entrada",
+      "name": "Webhook — Novo Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "hub-sdr-lead-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validar e normalizar dados do lead recebido\nconst body = $input.first().json.body ?? $input.first().json;\n\nconst lead = {\n  nome:    (body.nome    ?? '').trim(),\n  email:   (body.email   ?? '').toLowerCase().trim(),\n  telefone: body.telefone ?? null,\n  empresa: body.empresa  ?? null,\n  cargo:   body.cargo    ?? null,\n  origem:  body.origem   ?? 'webhook',\n  status:  'novo',\n  score:   0,\n};\n\nif (!lead.nome || !lead.email) {\n  throw new Error('Campos obrigatórios ausentes: nome e email');\n}\n\nreturn [{ json: lead }];"
+      },
+      "id": "node-validar-lead",
+      "name": "Validar e Normalizar Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "upsert",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "list"
+        },
+        "table": {
+          "__rl": true,
+          "value": "leads",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "nome":     "={{ $json.nome }}",
+            "email":    "={{ $json.email }}",
+            "telefone": "={{ $json.telefone }}",
+            "empresa":  "={{ $json.empresa }}",
+            "cargo":    "={{ $json.cargo }}",
+            "origem":   "={{ $json.origem }}",
+            "status":   "={{ $json.status }}",
+            "score":    "={{ $json.score }}"
+          },
+          "schema": [],
+          "matchingColumns": ["email"],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "node-salvar-supabase",
+      "name": "Salvar Lead no Supabase",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [680, 300],
+      "credentials": {
+        "supabaseApi": {
+          "id": "SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase Hub SDR"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Scoring simples baseado nos dados do lead\nconst lead = $input.first().json;\nlet score = 0;\n\nif (lead.cargo?.match(/CEO|CTO|Diretor|VP|Head/i))  score += 30;\nif (lead.empresa)                                    score += 10;\nif (lead.telefone)                                   score += 10;\nif (lead.origem === 'site')                          score += 5;\nif (lead.origem === 'linkedin')                      score += 15;\nif (lead.origem === 'indicacao')                     score += 20;\n\nconst qualificado = score >= 30;\n\nreturn [{ json: { ...lead, score, qualificado } }];"
+      },
+      "id": "node-scoring",
+      "name": "Calcular Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-qualificado",
+              "leftValue": "={{ $json.qualificado }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-qualificado",
+      "name": "Lead Qualificado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "sdr@suaempresa.com.br",
+        "toEmail": "={{ $json.email }}",
+        "subject": "Olá, {{ $json.nome }} — vamos conversar?",
+        "emailType": "html",
+        "message": "<p>Olá, <strong>{{ $json.nome }}</strong>!</p>\n<p>Vi que você tem interesse em nossas soluções. Podemos agendar uma conversa rápida de 15 minutos?</p>\n<p><a href='https://cal.com/sdr/15min'>Clique aqui para agendar</a></p>\n<p>Abraços,<br>Time SDR</p>",
+        "options": {}
+      },
+      "id": "node-email-qualificado",
+      "name": "Email — Lead Qualificado",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1340, 200],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Hub SDR"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "chatId": "={{ $env.TELEGRAM_SDR_CHAT_ID }}",
+        "text": "=🔔 *Novo lead qualificado!*\n\n*Nome:* {{ $json.nome }}\n*Email:* {{ $json.email }}\n*Empresa:* {{ $json.empresa ?? '—' }}\n*Score:* {{ $json.score }}\n*Origem:* {{ $json.origem }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "node-telegram-alerta",
+      "name": "Telegram — Alerta SDR",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1340, 340],
+      "credentials": {
+        "telegramApi": {
+          "id": "TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram Hub SDR"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "sdr@suaempresa.com.br",
+        "toEmail": "={{ $json.email }}",
+        "subject": "Obrigado pelo interesse!",
+        "emailType": "html",
+        "message": "<p>Olá, <strong>{{ $json.nome }}</strong>!</p>\n<p>Recebemos seu contato e em breve nossa equipe entrará em contato.</p>\n<p>Abraços,<br>Time SDR</p>",
+        "options": {}
+      },
+      "id": "node-email-nurturing",
+      "name": "Email — Nurturing",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1340, 460],
+      "credentials": {
+        "smtp": {
+          "id": "SMTP_CREDENTIAL_ID",
+          "name": "SMTP Hub SDR"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, lead_id: $('Salvar Lead no Supabase').first().json.id, score: $json.score }) }}",
+        "options": {}
+      },
+      "id": "node-resposta",
+      "name": "Resposta Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1560, 300]
+    }
+  ],
+  "connections": {
+    "Webhook — Novo Lead": {
+      "main": [
+        [{ "node": "Validar e Normalizar Lead", "type": "main", "index": 0 }]
+      ]
+    },
+    "Validar e Normalizar Lead": {
+      "main": [
+        [{ "node": "Salvar Lead no Supabase", "type": "main", "index": 0 }]
+      ]
+    },
+    "Salvar Lead no Supabase": {
+      "main": [
+        [{ "node": "Calcular Score", "type": "main", "index": 0 }]
+      ]
+    },
+    "Calcular Score": {
+      "main": [
+        [{ "node": "Lead Qualificado?", "type": "main", "index": 0 }]
+      ]
+    },
+    "Lead Qualificado?": {
+      "main": [
+        [
+          { "node": "Email — Lead Qualificado", "type": "main", "index": 0 },
+          { "node": "Telegram — Alerta SDR",   "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Email — Nurturing", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Email — Lead Qualificado": {
+      "main": [
+        [{ "node": "Resposta Webhook", "type": "main", "index": 0 }]
+      ]
+    },
+    "Email — Nurturing": {
+      "main": [
+        [{ "node": "Resposta Webhook", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": ["hub-sdr", "leads", "outbound"],
+  "triggerCount": 0,
+  "updatedAt": "2026-05-20T00:00:00.000Z",
+  "versionId": "1"
+}
