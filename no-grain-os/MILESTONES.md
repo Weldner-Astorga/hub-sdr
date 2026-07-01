@@ -202,16 +202,28 @@ NOTIFY pgrst, 'reload schema';
   - `updateStatus()` agora sincroniza `trizyCotacoes` (antes só `fretes`) + trata falha de rede/HTTP com toast
   - `CountdownSLA`: limiares ajustados para >2h verde / <2h laranja (cobre "<1h") / <15min vermelho `animate-pulse` (mecanismo `useEffect`+`setInterval` 1s já existia, corrigido o breakpoint)
   - ID Trizy na tabela do Radar: `text-sm font-bold text-orange-500 tracking-wide`
-- **Validado:** `tsc --noEmit` limpo (único erro remanescente é `leaflet` ausente do `node_modules`, pré-existente, fora do escopo — pertence a M13/MapaRota.tsx) + `eslint` sem erros novos (warnings pré-existentes de `react-hooks/set-state-in-effect` em código não tocado)
-
-**Armadilha para M13:** se `painel_fretes` tiver `CHECK constraint` no `status` (ver `m6_status_constraint.sql`), gravar `COTADO_AGUARDANDO` vai 500 até rodar migration adicionando o valor — mesmo padrão do trap já documentado abaixo.
+- **Validado:** `tsc --noEmit` limpo (único erro remanescente é `leaflet` ausente do `node_modules`, pré-existente, fora do escopo — pertence a M14/MapaRota.tsx) + `eslint` sem erros novos (warnings pré-existentes de `react-hooks/set-state-in-effect` em código não tocado)
 
 ---
 
-### M13 — Pipeline "Cotado Aguardando" + Export Geolocalizado (Backlog)
-- Status `COTADO_AGUARDANDO` setado ao salvar preço comercial (`PATCH /cotacoes/{id}/preco`) — precisa migration de constraint em `painel_fretes` antes
-- Nova aba/card "Cotado Aguardando Resposta" — oculto dos radares ativos, 100% editável
-- `buildDadosBrutos()` em `app/page.tsx` — incluir `origem_maps_link`/`destino_maps_link` no template de cópia (já existem no tipo, só não estão no template atual)
+### M13 — Pipeline "Aguardando Resposta" + Export Geolocalizado ✅
+**Entregue:** 2026-07-01
+
+**Decisão de produto (confirmada com o usuário):** em vez de `COTADO_AGUARDANDO` substituir o roteamento por margem do M6/M7, ele **convive** com ele. O backend (`/cotacoes/{id}/preco`) continua calculando `COTACAO_FILIAL`/`APROV_DIRETORIA` normalmente — nada mudou lá. O que mudou é só a camada de visualização: um cluster de status "já cotado, aguardando cliente" (`COTACAO_FILIAL`, `APROV_DIRETORIA`, `RESPONDIDA`, `COTADO_AGUARDANDO`) agora sai do radar ativo por padrão.
+
+**O que foi criado (`app/page.tsx`):**
+- `STATUS_AGUARDANDO` (Set) — cluster dos 4 status acima
+- `cotacoesVisiveis` — oculta o cluster do Radar por padrão; escape hatch: se o operador filtrar explicitamente por um desses status no dropdown "Status", eles voltam a aparecer
+- Novo KPI card clicável "Aguardando Resposta" (grid 3→4 colunas) — toggle que mostra *só* o cluster, reaproveitando a mesma tabela + `CotacaoDrawer` já existentes (sem duplicar UI) — herda de graça o "Alterar Dados" e o input de preço já 100% editáveis
+- `buildDadosBrutos()` — template reescrito: primeira linha é o ID puro (sem prefixo), acrescido `MAPS ORIGEM`/`MAPS DESTINO` (campos `origem_maps_link`/`destino_maps_link`, já existiam no tipo mas não eram lidos)
+
+**Testado em produção (VPS, dados reais):**
+- PATCH real setando `APROV_DIRETORIA` numa cotação → some do Radar ativo (82→80) e aparece no card "Aguardando Resposta" (0→2 — achou também 1 item pré-existente real em `RESPONDIDA` que já estava "escondido à vista" no radar antes desta fix)
+- Clique no card abre a lista filtrada corretamente (confirmado via Puppeteer, screenshot)
+- Bundle de produção confirmado com `MAPS ORIGEM`/`MAPS DESTINO`/`COTADO_AGUARDANDO` compilados
+- Dado de teste restaurado ao estado original após validação
+
+**Gap descoberto (backlog, não bloqueia M13):** `PATCH /cotacoes/{id}/preco` e `/calcular` **não têm** o mesmo fallback Trizy que `/status` recebeu no M12 — `painel_fretes.id` é `uuid`, então "Salvar Preço Proposto" no Workspace falha silenciosamente (500) para cotações Trizy. `/status` já funciona (path `RESPONDIDA` via "Copiar WhatsApp" cobre Trizy hoje). `/calcular` precisaria de colunas novas em `octamove_extracao_trizy` (não tem `pedagio_total_calc`/`antt_piso_por_ton`); `/preco` poderia mapear para a coluna `valor_proposto_ton` já existente.
 
 ### M14 — Calculadora RAG + Mapa + Saneamento Endereço (Backlog)
 - Corrigir `ragData` do `POST /api/precificar/rag` no workspace `[id]/page.tsx`

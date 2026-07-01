@@ -197,7 +197,7 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | # | Milestone | Status |
 |---|-----------|--------|
 | M12 | Saneamento Status/SLA/Tipografia Radar — fix raiz do dropdown revertendo (Trizy usava tabela errada no PATCH) | ✅ 2026-07-01 |
-| M13 | Pipeline `COTADO_AGUARDANDO` + export geolocalizado (maps links no template de cópia) | Backlog |
+| M13 | Pipeline "Aguardando Resposta" (convive c/ roteamento por margem) + export geolocalizado (maps links no template de cópia) | ✅ 2026-07-01 |
 | M14 | Calculadora: RAG lateral + saneamento de endereço + mapa HD (bloqueado por dep `leaflet`/`@tremor` — ver Armadilhas) | Backlog |
 | M15 | Ongo: view planilha + métricas de Aderência % + fechamento diário RAG | Backlog |
 | M16 | Gmail anti-ruído + triagem WhatsApp + card Liberações + botão `[Tratado]` | Backlog |
@@ -231,4 +231,5 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | Evolution `groups_ignore: true` | Padrão ao criar instância | Setar `false` após criar |
 | GPT-4o-mini `nivel_confianca` não-determinístico | Temperatura do modelo | Não usar como gate de cotação |
 | `node_modules` sem `leaflet`/`@types/leaflet` instalados + conflito peer dep `@tremor/react` (React 18) vs `react@19.2.4` | `npm install` nunca rodado após adicionar `leaflet` ao `package.json`, ou rodado sem `--legacy-peer-deps` | Antes de M14: `npm install --legacy-peer-deps` (mesmo padrão já documentado para a VPS) |
-| Novo valor de `status` (ex.: `COTADO_AGUARDANDO` de M13) pode causar 500 | `CHECK constraint` em `painel_fretes.status` (`m6_status_constraint.sql`) só aceita os 8 valores originais | Rodar migration adicionando o valor ao constraint antes de M13 gravar `COTADO_AGUARDANDO` |
+| Novo valor de `status` (ex.: `COTADO_AGUARDANDO`) pode causar 500 | `CHECK constraint` em `painel_fretes.status` (`m6_status_constraint.sql`) só aceita os 8 valores originais | Rodar migration adicionando o valor ao constraint antes de gravar `COTADO_AGUARDANDO` diretamente |
+| "Salvar Preço Proposto" falha silenciosamente pra cotações Trizy no Workspace | `PATCH /cotacoes/{id}/preco` só atualiza `painel_fretes` (coluna `id` é `uuid`); ids Trizy não são uuid | Aplicar o mesmo fallback Trizy que `/status` já tem (M12), mapeando pra coluna `valor_proposto_ton` |

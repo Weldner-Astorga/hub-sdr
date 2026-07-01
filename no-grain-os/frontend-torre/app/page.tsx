@@ -7,7 +7,7 @@ import {
   Activity, MapPin, Wheat, ExternalLink, Filter, X,
   CheckCircle2, Clock, Inbox, RotateCcw, Copy, Check,
   Eye, ArrowUpRight, Loader2, Trophy, XCircle, Calculator,
-  Radio, Bell, Truck,
+  Radio, Bell, Truck, Send,
 } from 'lucide-react'
 import type { CargaLogistica, ApiResponse, FonteIngestao, StatusCotacao } from '@/types/carga'
 
@@ -32,6 +32,13 @@ const STATUS_OPCOES: StatusCotacao[] = [
   'RECEBIDA', 'CALCULADA', 'PENDENTE', 'COTACAO_FILIAL',
   'APROV_DIRETORIA', 'RESPONDIDA', 'GANHA', 'PERDIDA',
 ]
+
+// M13 — "já cotado, aguardando resposta do cliente". Convive com o roteamento
+// por margem do M6/M7 (COTACAO_FILIAL/APROV_DIRETORIA continuam calculados
+// normalmente pelo backend); esses status só saem do radar ativo por padrão.
+const STATUS_AGUARDANDO = new Set<StatusCotacao>([
+  'COTACAO_FILIAL', 'APROV_DIRETORIA', 'RESPONDIDA', 'COTADO_AGUARDANDO',
+])
 
 type FonteConfig = {
   label: string; cardLabel: string; badgeCls: string; iconCls: string
@@ -326,14 +333,16 @@ function CotacaoDrawer({
 
   function buildDadosBrutos(c: CargaLogistica): string {
     const linhas = [
-      `ID: ${c.id}`,
+      c.id,
       `CLIENTE: ${c.cliente && c.cliente !== 'Não Identificado' ? c.cliente : (c.embarcador ?? '—')}`,
       `EMBARCADOR: ${c.embarcador ?? '—'}`,
       `CONTATO: ${c.contato ?? '—'}`,
       `ORIGEM: ${c.origem}`,
       `PONTO COLETA: ${c.origem_localidade || '—'}`,
+      `MAPS ORIGEM: ${c.origem_maps_link || '—'}`,
       `DESTINO: ${c.destino}`,
       `PONTO ENTREGA: ${c.destino_localidade || '—'}`,
+      `MAPS DESTINO: ${c.destino_maps_link || '—'}`,
       `PRODUTO: ${c.produto}`,
       `VEICULO: ${c.tipo_veiculo}`,
       `VALOR COTADO: R$ ${c.valor_tonelada.toFixed(2)}/t`,
@@ -815,9 +824,10 @@ export default function TorreDeControle() {
   const [backendError, setBackendError] = useState<string | null>(null)
   const [updatingId,   setUpdatingId]   = useState<string | null>(null)
 
-  const [filtroCliente, setFiltroCliente] = useState('')
-  const [filtroFonte,   setFiltroFonte]   = useState<FonteIngestao | ''>('')
-  const [filtroStatus,  setFiltroStatus]  = useState<StatusCotacao | ''>('')
+  const [filtroCliente,    setFiltroCliente]    = useState('')
+  const [filtroFonte,      setFiltroFonte]      = useState<FonteIngestao | ''>('')
+  const [filtroStatus,     setFiltroStatus]     = useState<StatusCotacao | ''>('')
+  const [filtroAguardando, setFiltroAguardando] = useState(false)
 
   const [trizyCount,      setTrizyCount]      = useState(0)
   const [trizyCotacoes,   setTrizyCotacoes]   = useState<CargaLogistica[]>([])
@@ -927,9 +937,10 @@ export default function TorreDeControle() {
     [fretes, trizyCotacoes],
   )
 
-  const totalRecebidas = cotacoes.length
-  const totalPendentes = cotacoes.filter(c => c.status === 'PENDENTE' || !c.status).length
-  const totalGanhas    = cotacoes.filter(c => c.status === 'GANHA').length
+  const totalRecebidas   = cotacoes.length
+  const totalPendentes   = cotacoes.filter(c => c.status === 'PENDENTE' || !c.status).length
+  const totalGanhas      = cotacoes.filter(c => c.status === 'GANHA').length
+  const totalAguardando  = cotacoes.filter(c => !isLixoCotacao(c) && c.status && STATUS_AGUARDANDO.has(c.status)).length
 
   const clientesUnicos = useMemo(() => {
     const set = new Set<string>()
@@ -939,14 +950,23 @@ export default function TorreDeControle() {
 
   const cotacoesVisiveis = useMemo(() => cotacoes.filter(c => {
     if (isLixoCotacao(c)) return false
+    const isAguardando = !!(c.status && STATUS_AGUARDANDO.has(c.status))
+    // Aba "Aguardando Resposta" ativa → mostra só o cluster. Caso contrário, oculta
+    // o cluster do radar ativo por padrão, exceto se o operador filtrar explicitamente
+    // por um desses status via dropdown (escape hatch para revisão manual).
+    if (filtroAguardando) {
+      if (!isAguardando) return false
+    } else if (isAguardando && !(filtroStatus && STATUS_AGUARDANDO.has(filtroStatus))) {
+      return false
+    }
     const clienteOk = !filtroCliente || c.embarcador === filtroCliente
     const fonteOk   = !filtroFonte   || c.fonte_ingestao === filtroFonte
     const statusOk  = !filtroStatus  || c.status === filtroStatus || (!c.status && filtroStatus === 'PENDENTE')
     return clienteOk && fonteOk && statusOk
-  }), [cotacoes, filtroCliente, filtroFonte, filtroStatus])
+  }), [cotacoes, filtroCliente, filtroFonte, filtroStatus, filtroAguardando])
 
-  const filtroAtivo = !!(filtroCliente || filtroFonte || filtroStatus)
-  const limparFiltros = () => { setFiltroCliente(''); setFiltroFonte(''); setFiltroStatus('') }
+  const filtroAtivo = !!(filtroCliente || filtroFonte || filtroStatus || filtroAguardando)
+  const limparFiltros = () => { setFiltroCliente(''); setFiltroFonte(''); setFiltroStatus(''); setFiltroAguardando(false) }
 
   return (
     <div className="min-h-screen bg-zinc-950 text-white flex flex-col">
@@ -1016,20 +1036,20 @@ export default function TorreDeControle() {
 
         {/* 2) STATUS DASHBOARD + FILTROS */}
         <div className="flex flex-col gap-4">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
 
             {/* Total — limpa filtros ao clicar */}
             <button
               type="button"
               className={`text-left bg-zinc-900 border rounded-xl p-5 cursor-pointer transition-all ${
-                !filtroStatus ? 'border-zinc-600 ring-1 ring-zinc-600/50' : 'border-zinc-800 hover:border-zinc-700'
+                !filtroStatus && !filtroAguardando ? 'border-zinc-600 ring-1 ring-zinc-600/50' : 'border-zinc-800 hover:border-zinc-700'
               }`}
               onClick={limparFiltros}
             >
               <div className="flex items-center gap-2 mb-3">
                 <div className="p-1.5 rounded-lg bg-zinc-800"><Inbox size={13} className="text-zinc-400" /></div>
                 <p className="text-[11px] text-zinc-500 font-semibold uppercase tracking-wide">Cotações Recebidas</p>
-                {!filtroStatus && <span className="ml-auto text-[9px] bg-zinc-700 text-zinc-400 px-1.5 py-0.5 rounded-full font-semibold">TODOS</span>}
+                {!filtroStatus && !filtroAguardando && <span className="ml-auto text-[9px] bg-zinc-700 text-zinc-400 px-1.5 py-0.5 rounded-full font-semibold">TODOS</span>}
               </div>
               <p className="text-4xl font-bold text-white tabular-nums">{totalRecebidas}</p>
               <p className="text-[11px] text-zinc-600 mt-1.5">Trizy + WhatsApp + Gmail</p>
@@ -1043,7 +1063,7 @@ export default function TorreDeControle() {
                   ? 'border-amber-500/70 ring-1 ring-amber-500/40'
                   : 'border-amber-500/30 hover:border-amber-500/50'
               }`}
-              onClick={() => setFiltroStatus(prev => prev === 'PENDENTE' ? '' : 'PENDENTE')}
+              onClick={() => { setFiltroAguardando(false); setFiltroStatus(prev => prev === 'PENDENTE' ? '' : 'PENDENTE') }}
             >
               <div className="flex items-center gap-2 mb-3">
                 <div className="p-1.5 rounded-lg bg-amber-500/10"><Clock size={13} className="text-amber-400" /></div>
@@ -1054,6 +1074,25 @@ export default function TorreDeControle() {
               <p className="text-[11px] text-zinc-600 mt-1.5">aguardando retorno comercial</p>
             </button>
 
+            {/* Cotado Aguardando Resposta — M13 */}
+            <button
+              type="button"
+              className={`text-left bg-zinc-900 border rounded-xl p-5 cursor-pointer transition-all ${
+                filtroAguardando
+                  ? 'border-cyan-500/70 ring-1 ring-cyan-500/40'
+                  : 'border-cyan-500/25 hover:border-cyan-500/50'
+              }`}
+              onClick={() => { setFiltroStatus(''); setFiltroAguardando(v => !v) }}
+            >
+              <div className="flex items-center gap-2 mb-3">
+                <div className="p-1.5 rounded-lg bg-cyan-500/10"><Send size={13} className="text-cyan-400" /></div>
+                <p className="text-[11px] text-cyan-500/80 font-semibold uppercase tracking-wide">Aguardando Resposta</p>
+                {filtroAguardando && <span className="ml-auto text-[9px] bg-cyan-500/20 text-cyan-400 px-1.5 py-0.5 rounded-full font-semibold">ATIVO</span>}
+              </div>
+              <p className="text-4xl font-bold text-cyan-400 tabular-nums">{totalAguardando}</p>
+              <p className="text-[11px] text-zinc-600 mt-1.5">já cotado, aguardando cliente</p>
+            </button>
+
             {/* Ganhas */}
             <button
               type="button"
@@ -1062,7 +1101,7 @@ export default function TorreDeControle() {
                   ? 'border-emerald-500/70 ring-1 ring-emerald-500/40'
                   : 'border-emerald-500/20 hover:border-emerald-500/40'
               }`}
-              onClick={() => setFiltroStatus(prev => prev === 'GANHA' ? '' : 'GANHA')}
+              onClick={() => { setFiltroAguardando(false); setFiltroStatus(prev => prev === 'GANHA' ? '' : 'GANHA') }}
             >
               <div className="flex items-center gap-2 mb-3">
                 <div className="p-1.5 rounded-lg bg-emerald-500/10"><CheckCircle2 size={13} className="text-emerald-400" /></div>
