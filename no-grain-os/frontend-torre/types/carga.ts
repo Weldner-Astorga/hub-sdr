@@ -11,10 +11,9 @@ export type StatusCotacao =
   | 'COTACAO_FILIAL'
   | 'APROV_DIRETORIA'
   | 'RESPONDIDA'
+  | 'COTADO_AGUARDANDO'
   | 'GANHA'
   | 'PERDIDA'
-  | 'sem_resposta'
-  | 'respondida'
 
 export interface CargaLogistica {
   id: string

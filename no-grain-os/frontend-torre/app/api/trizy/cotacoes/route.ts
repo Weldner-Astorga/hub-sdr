@@ -15,6 +15,13 @@ function parsePreco(v: unknown): number {
   return isNaN(n) ? 0 : n
 }
 
+// status_crm parte como 'Novo' (default do extrator) — fora do enum StatusCotacao,
+// normaliza para RECEBIDA. Valores já canônicos (uppercase) passam direto.
+function normalizeStatus(v: unknown): string {
+  const s = str(v)
+  return s && s !== 'Novo' ? s : 'RECEBIDA'
+}
+
 function mapRow(r: TrizyRow) {
   // Prioridade: cidade/UF (legível e geocodificável) → string completa → nome do ponto
   const origem = [r.origem_cidade, r.origem_estado].filter(Boolean).join('/')
@@ -54,7 +61,7 @@ function mapRow(r: TrizyRow) {
     sem_prazo:             prazo == null,
     distancia_km:          r.distancia_km != null ? Number(r.distancia_km) : null,
     observacoes:           str(r.observacao_geral),
-    status:                str(r.status_crm, 'RECEBIDA'),
+    status:                normalizeStatus(r.status_crm),
     criado_em:             str(r.criado_em),
     id_ongo:               '',
     preco_proposto:        r.valor_proposto_ton != null ? Number(r.valor_proposto_ton) : null,

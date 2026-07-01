@@ -21,12 +21,11 @@ const STATUS_CONFIG: Record<string, { label: string; cls: string }> = {
   PENDENTE:        { label: 'Pendente',    cls: 'bg-zinc-500/15 text-zinc-400 border border-zinc-500/30' },
   COTACAO_FILIAL:  { label: 'Filial',      cls: 'bg-blue-500/15 text-blue-400 border border-blue-500/30' },
   APROV_DIRETORIA: { label: 'Diretoria',   cls: 'bg-violet-500/15 text-violet-400 border border-violet-500/30' },
-  RESPONDIDA:      { label: 'Respondida',  cls: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30' },
-  GANHA:           { label: '✓ Ganha',     cls: 'bg-emerald-600/25 text-emerald-300 border border-emerald-400/40' },
-  PERDIDA:         { label: 'Perdida',     cls: 'bg-red-500/15 text-red-400 border border-red-500/30' },
-  sem_resposta:    { label: 'Aguardando',  cls: 'bg-amber-500/15 text-amber-400 border border-amber-500/30' },
-  respondida:      { label: 'Respondida',  cls: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30' },
-  Novo:            { label: 'Nova',        cls: 'bg-sky-500/15 text-sky-400 border border-sky-500/30' },
+  RESPONDIDA:        { label: 'Respondida',        cls: 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30' },
+  COTADO_AGUARDANDO: { label: 'Aguardando Resp.',  cls: 'bg-amber-500/15 text-amber-400 border border-amber-500/30' },
+  GANHA:             { label: '✓ Ganha',           cls: 'bg-emerald-600/25 text-emerald-300 border border-emerald-400/40' },
+  PERDIDA:           { label: 'Perdida',           cls: 'bg-red-500/15 text-red-400 border border-red-500/30' },
+  Novo:              { label: 'Nova',              cls: 'bg-sky-500/15 text-sky-400 border border-sky-500/30' },
 }
 
 const STATUS_OPCOES: StatusCotacao[] = [
@@ -159,7 +158,7 @@ function CountdownSLA({ deadline, criado_em }: { deadline?: string; criado_em?: 
   if (ms < 15 * 60 * 1000) {
     return <span className="text-red-400 font-bold text-[11px] animate-pulse tabular-nums font-mono">{label}</span>
   }
-  if (ms < 60 * 60 * 1000) {
+  if (ms < 2 * 60 * 60 * 1000) {
     return <span className="text-amber-400 font-semibold text-[11px] tabular-nums font-mono">{label}</span>
   }
   return <span className="text-emerald-400 text-[11px] tabular-nums font-mono">{label}</span>
@@ -899,8 +898,13 @@ export default function TorreDeControle() {
       const res = await fetch(`/api/cotacoes/${id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ status: newStatus }) })
       if (res.ok) {
         setFretes(prev => prev.map(f => f.id === id ? { ...f, status: newStatus } : f))
+        setTrizyCotacoes(prev => prev.map(f => f.id === id ? { ...f, status: newStatus } : f))
         setDrawerItem(prev => prev?.id === id ? { ...prev, status: newStatus } : prev)
+      } else {
+        showToast('Falha ao salvar status — tente novamente.')
       }
+    } catch {
+      showToast('Erro de rede ao atualizar status.')
     } finally { setUpdatingId(null) }
   }, [])
 
@@ -924,7 +928,7 @@ export default function TorreDeControle() {
   )
 
   const totalRecebidas = cotacoes.length
-  const totalPendentes = cotacoes.filter(c => c.status === 'PENDENTE' || c.status === 'sem_resposta' || !c.status).length
+  const totalPendentes = cotacoes.filter(c => c.status === 'PENDENTE' || !c.status).length
   const totalGanhas    = cotacoes.filter(c => c.status === 'GANHA').length
 
   const clientesUnicos = useMemo(() => {
@@ -1181,7 +1185,7 @@ export default function TorreDeControle() {
                         <td className="px-4 py-3 whitespace-nowrap">
                           <p className="text-xs text-zinc-200 font-medium mb-0.5">{trunc(cot.embarcador, 22)}</p>
                           {cot.fonte_ingestao === 'ongo_cotacao' && cot.id_externo && (
-                            <p className="text-[10px] text-orange-400/70 font-mono mb-0.5">#{cot.id_externo}</p>
+                            <p className="text-sm font-bold text-orange-500 tracking-wide mb-0.5">#{cot.id_externo}</p>
                           )}
                           <FreteBadge fonte={cot.fonte_ingestao} />
                         </td>
