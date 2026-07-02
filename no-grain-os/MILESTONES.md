@@ -241,7 +241,29 @@ NOTIFY pgrst, 'reload schema';
 **5. Mapa + tipografia:** `MapaRota.tsx` — basemap CartoDB `dark_all` (era `light_all`, branco sobre UI dark = baixo contraste); rota com casing escuro por baixo + linha viva `#38bdf8` por cima (técnica cartográfica padrão); marcadores de pedágio com borda branca e raio maior. Inputs Origem/Destino/Produto `text-xs→text-sm`; Preço Proposto `text-xs→text-base font-semibold`; valores "Proposto"/"vs ANTT" e lista RAG `text-[10-11px]→text-base/text-sm`.
 - Corrigido de bônus (mesmo arquivo, mesmo lint pass): 2x `react/no-unescaped-entities` (aspas retas em JSX).
 
-**⚠️ Achado crítico fora do escopo — bloqueia TODA a calculadora:** `POST https://api.qualp.com.br/router/v4` retorna **404** (log do backend: `httpx.HTTPStatusError: Client error '404 Not Found'`). Não é causado por nenhuma mudança desta sessão (não toquei em `qualp_service.py`/`precificar.py`) — a API externa da QualP parece ter mudado de contrato/versão. **Isso impede validar visualmente o mapa/RAG/margem com uma rota calculada de verdade em produção** — só foi possível confirmar via build + lint + testes unitários de lógica no console. Precisa investigação separada (token QUALP_API_TOKEN válido? endpoint mudou de versão?) antes de qualquer novo trabalho na calculadora.
+---
+
+### Hotfix crítico — QualP `/router/v4` 404 → `/rotas/v4` ✅
+**Entregue:** 2026-07-02 (mesmo dia, resolvido com a URL/token corretos fornecidos pelo usuário)
+
+O achado do M14 ("bloqueia TODA a calculadora") tinha duas causas empilhadas, não uma:
+
+1. **URL errada:** `QUALP_URL` apontava para `/router/v4` (404). Correto: `/rotas/v4`.
+2. **Header de auth errado:** o código usava `Authorization: Bearer <token>` → `/rotas/v4` respondia 401 "invalid credentials" mesmo com o token certo. QualP espera `access-token: <token>` (header próprio, sem "Bearer"). Descoberto testando as duas variantes via curl direto contra a API real antes de tocar no código.
+3. **Schema de resposta é inteiramente diferente do que o código esperava** (provavelmente o código foi escrito contra uma versão de API/documentação diferente da que está live). Nomes em português, não em inglês:
+   - `distancia.valor` (já em km — o código antigo tentava `data["distance"]` e dividia por 1000 assumindo metros)
+   - `pedagios` é uma **lista** de praças, cada uma com `tarifa: {"<eixos>": valor}` (dict por número de eixos, não um total pronto) e **sem lat/lng** — só um `p_index` (índice do ponto correspondente dentro da polyline)
+   - `polilinha_codificada`: polyline codificada no algoritmo padrão do Google, mas com **precisão 1e6** (não a 1e5 default do Google Maps) — precisou implementar `_decode_polyline()` do zero (sem lib nova) e usar `p_index` pra resolver lat/lng de cada pedágio
+   - `tabela_frete.dados.A.<eixos>.<categoria>` — dict aninhado, não uma lista
+
+**Processo de validação (nada foi deployado às cegas):**
+1. `curl` direto na API real com o payload completo do `_build_payload()` já existente → confirmou schema real
+2. Protótipo standalone em Python decodificando a polyline e comparando com `coordenada_inicio`/`coordenada_fim` da própria resposta → bateu
+3. Reescreveu `_extract_distance/_extract_polyline/_extract_tolls/_extract_freight_table` no `qualp_service.py`
+4. Testou as funções reais do módulo editado contra a resposta real salva (`sys.path` + import direto, sem precisar do servidor rodando)
+5. Deploy na VPS + teste end-to-end via Puppeteer navegando na Torre real: clicou "Calcular Rota" numa cotação Trizy real → mapa escuro renderizou com rota real (278km, Brasnorte/MT→Campos de Júlio/MT), piso ANTT R$69,08/t, painel RAG mostrando o empty-state do M14, margem com preço de teste R$95/t em `text-base`
+
+**Conclusão:** M14 está 100% validado visualmente agora — o bloqueador que impedia a confirmação completa foi removido no mesmo dia.
 
 ### M15 — Módulo Ongo Planilha + Aderência + RAG Diário (Backlog)
 - View em modo planilha ao clicar no card Ongo (187 registros), com filtros e agrupamento por município
