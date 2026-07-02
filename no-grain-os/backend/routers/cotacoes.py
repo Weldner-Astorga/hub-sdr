@@ -61,25 +61,42 @@ async def _update(cotacao_id: str, fields: dict):
     return resp.data[0]
 
 
-def _update_status_trizy_sync(id_frete_externo: str, status: str):
+# painel_fretes usa nomes de coluna genéricos; octamove_extracao_trizy usa os
+# nomes próprios do scraper (USER_FIELDS em trizy_extractor.py). Só os campos
+# com equivalente conhecido na tabela Trizy são repassados — os demais (ex.:
+# antt_piso_por_ton/pedagio_total_calc do /calcular) não têm coluna lá ainda.
+_TRIZY_FIELD_MAP = {
+    "status":          "status_crm",
+    "preco_proposto":  "valor_proposto_ton",
+}
+
+
+def _update_trizy_sync(id_frete_externo: str, fields: dict):
+    mapped = {_TRIZY_FIELD_MAP[k]: v for k, v in fields.items() if k in _TRIZY_FIELD_MAP}
     resp = (
         _client()
         .table("octamove_extracao_trizy")
-        .update({"status_crm": status})
+        .update(mapped)
         .eq("id_frete_externo", id_frete_externo)
         .execute()
     )
     return resp
 
 
-async def _update_status_trizy(id_frete_externo: str, status: str) -> dict:
+async def _update_trizy(id_frete_externo: str, fields: dict) -> dict:
     """
     Fallback para cotações vindas do Trizy BID: essas linhas vivem em
-    octamove_extracao_trizy (chave id_frete_externo, coluna status_crm),
-    não em painel_fretes. Acionado quando o update primário 404.
+    octamove_extracao_trizy (chave id_frete_externo), não em painel_fretes.
+    Acionado quando o update primário 404 (id não é uuid válido).
     """
+    sem_equivalente = [k for k in fields if k not in _TRIZY_FIELD_MAP]
+    if sem_equivalente:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Campos sem equivalente na tabela Trizy: {sem_equivalente}",
+        )
     try:
-        resp = _update_status_trizy_sync(id_frete_externo, status)
+        resp = _update_trizy_sync(id_frete_externo, fields)
     except Exception as exc:
         logger.error(f"[Cotacoes] Supabase Trizy update failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Erro ao atualizar Trizy: {exc}")
@@ -87,6 +104,7 @@ async def _update_status_trizy(id_frete_externo: str, status: str) -> dict:
         raise HTTPException(status_code=404, detail="Cotação não encontrada em painel_fretes nem Trizy.")
     row = resp.data[0]
     row["status"] = row.get("status_crm")
+    row["preco_proposto"] = row.get("valor_proposto_ton")
     return row
 
 
@@ -129,7 +147,7 @@ async def atualizar_status(cotacao_id: str, body: StatusUpdate):
     except HTTPException as exc:
         if exc.status_code != 404:
             raise
-        row = await _update_status_trizy(cotacao_id, body.status)
+        row = await _update_trizy(cotacao_id, {"status": body.status})
     logger.info(f"[Cotacoes] id={cotacao_id} → {body.status}")
 
     # Auto-indexa no RAG quando cotação é finalizada
@@ -188,10 +206,18 @@ async def salvar_preco(cotacao_id: str, body: PrecoUpdate):
         else "COTACAO_FILIAL"
     )
 
-    row = await _update(cotacao_id, {
-        "preco_proposto": body.preco_proposto,
-        "status":         novo_status,
-    })
+    try:
+        row = await _update(cotacao_id, {
+            "preco_proposto": body.preco_proposto,
+            "status":         novo_status,
+        })
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        row = await _update_trizy(cotacao_id, {
+            "preco_proposto": body.preco_proposto,
+            "status":         novo_status,
+        })
     logger.info(
         f"[Cotacoes] id={cotacao_id} → {novo_status} | "
         f"R${body.preco_proposto}/t | margem={margem_pct:.1f}% | "

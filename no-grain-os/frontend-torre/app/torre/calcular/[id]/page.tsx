@@ -99,6 +99,38 @@ function clipCopy(text: string): boolean {
   } catch { return false }
 }
 
+// ─── Saneamento de Origem/Destino ──────────────────────────────────────────────
+// QualP V4 só geocodifica "Cidade/UF". Dados brutos de scraper às vezes trazem
+// link cru do Google Maps ou string ruidosa (ex.: "S/L, S/N S/C - S/B, Itaituba - PA").
+
+const UF_RE = /\/[A-Z]{2}$|\s[-–]\s*[A-Z]{2}$/
+const MAPS_URL_RE = /https?:\/\/(www\.)?(google\.[a-z.]+\/maps|maps\.app\.goo\.gl|goo\.gl\/maps|maps\.google\.[a-z.]+)\S*/i
+// mesmo padrão do parse_endereco() do extrator Trizy: isola "Cidade - UF" do fim de um trecho ruidoso
+const CIDADE_UF_TAIL_RE = /([A-ZÀ-Ú][A-Za-zÀ-ú'.\s]*?)\s*[-–]\s*([A-Z]{2})\s*$/
+
+function sanitizeLocalizacao(raw: string, localidadeFallback?: string | null): string {
+  const texto = raw.trim()
+  if (!texto) return texto
+
+  // URL crua do Google Maps não tem texto geocodificável — usa o nome do ponto já conhecido
+  if (MAPS_URL_RE.test(texto)) {
+    return (localidadeFallback ?? '').trim()
+  }
+
+  // Isola "Cidade - UF" do último segmento de uma string ruidosa (comas/pontos).
+  // Precisa vir ANTES do check de "já limpo" abaixo: UF_RE só olha o final da
+  // string inteira, então strings ruidosas que terminam em "- UF" (ex.: "S/L,
+  // S/N S/C - S/B, Itaituba - PA") passariam batidas sem isolar o trecho certo.
+  const ultimaParte = texto.split(',').map(p => p.trim()).filter(Boolean).pop() ?? texto
+  const m = ultimaParte.match(CIDADE_UF_TAIL_RE)
+  if (m) return `${m[1].trim()}/${m[2]}`
+
+  // Já está limpo no formato "Cidade/UF" ou "Cidade - UF" (sem ruído de vírgulas)
+  if (UF_RE.test(texto)) return texto
+
+  return texto
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function WorkspaceCalcular() {
@@ -126,6 +158,7 @@ export default function WorkspaceCalcular() {
   const [erro,          setErro]          = useState<string | null>(null)
   const [ragData,       setRagData]       = useState<RagData | null>(null)
   const [ragLoading,    setRagLoading]    = useState(false)
+  const [ragAsOf,       setRagAsOf]       = useState(0)
 
   const [toastMsg,  setToastMsg]  = useState('')
   const [toastShow, setToastShow] = useState(false)
@@ -142,8 +175,12 @@ export default function WorkspaceCalcular() {
     if (!cotacaoId || cotacaoId === 'novo') return
 
     function aplicarItem(item: Record<string, unknown>) {
-      setOrigemInput((item.origem as string) || '')
-      setDestinoInput((item.destino as string) || '')
+      const origemLoc  = (item.origem_localidade as string | undefined)  ?? null
+      const destinoLoc = (item.destino_localidade as string | undefined) ?? null
+      // Saneia origem/destino brutos (link cru do Maps ou texto ruidoso do scraper)
+      // antes de jogar nos inputs — evita quebrar a validação Regex do QualP V4.
+      setOrigemInput(sanitizeLocalizacao((item.origem as string) || '', origemLoc))
+      setDestinoInput(sanitizeLocalizacao((item.destino as string) || '', destinoLoc))
       setProduto((item.produto as string) || '')
       if ((item.valor_tonelada as number) > 0) setPrecoTon(String(item.valor_tonelada))
       if (item.volume_total) setVolumeInfo(item.volume_total as string)
@@ -151,8 +188,8 @@ export default function WorkspaceCalcular() {
       const nomeEmb     = (item.embarcador as string | undefined)
       const displayNome = nomeCliente && nomeCliente !== 'Não Identificado' ? nomeCliente : nomeEmb
       if (displayNome && displayNome !== 'Não Identificado') setEmbarcador(displayNome)
-      if (item.origem_localidade) setOrigemLocalidade(item.origem_localidade as string)
-      if (item.destino_localidade) setDestinoLocalidade(item.destino_localidade as string)
+      if (origemLoc) setOrigemLocalidade(origemLoc)
+      if (destinoLoc) setDestinoLocalidade(destinoLoc)
       if (item.origem_maps_link) setOrigemMapsLink(item.origem_maps_link as string)
       if (item.destino_maps_link) setDestinoMapsLink(item.destino_maps_link as string)
     }
@@ -182,6 +219,7 @@ export default function WorkspaceCalcular() {
       })
       const data = await res.json()
       setRagData(data as RagData)
+      setRagAsOf(Date.now())
     } catch { /* silencia — RAG é secundário */ }
     finally { setRagLoading(false) }
   }
@@ -315,7 +353,6 @@ export default function WorkspaceCalcular() {
   const podeCalcular = origemInput.trim() !== '' && destinoInput.trim() !== ''
 
   // Detecta se origem/destino tem formato geocodificável ("Texto/UF" ou "Texto - UF")
-  const UF_RE = /\/[A-Z]{2}$|\s[-–]\s*[A-Z]{2}$/
   const origemGeoOk  = UF_RE.test(origemInput.trim())
   const destinoGeoOk = UF_RE.test(destinoInput.trim())
 
@@ -374,7 +411,7 @@ export default function WorkspaceCalcular() {
                   <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Origem</label>
                   <input type="text" value={origemInput} onChange={e => setOrigemInput(e.target.value)}
                     placeholder="Ex: Rondonópolis/MT"
-                    className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700"
+                    className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700"
                   />
                   {origemLocalidade && (
                     <p className="mt-1 text-[9px] text-zinc-600 flex items-center gap-1">
@@ -388,16 +425,24 @@ export default function WorkspaceCalcular() {
                     </a>
                   )}
                   {origemInput.trim() && !origemGeoOk && (
-                    <p className="mt-1 text-[9px] text-amber-500 flex items-center gap-1">
-                      <AlertCircle size={8} className="shrink-0" /> Ajuste para "Cidade/UF" antes de calcular
-                    </p>
+                    <div className="mt-1 flex items-center gap-2">
+                      <p className="text-[9px] text-amber-500 flex items-center gap-1">
+                        <AlertCircle size={8} className="shrink-0" /> Ajuste para &quot;Cidade/UF&quot; antes de calcular
+                      </p>
+                      <button type="button"
+                        onClick={() => setOrigemInput(sanitizeLocalizacao(origemInput, origemLocalidade))}
+                        className="text-[9px] text-emerald-400 hover:text-emerald-300 font-semibold underline underline-offset-2 shrink-0"
+                      >
+                        Copiar Localização
+                      </button>
+                    </div>
                   )}
                 </div>
                 <div>
                   <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Destino</label>
                   <input type="text" value={destinoInput} onChange={e => setDestinoInput(e.target.value)}
                     placeholder="Ex: Santos/SP"
-                    className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700"
+                    className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700"
                   />
                   {destinoLocalidade && (
                     <p className="mt-1 text-[9px] text-zinc-600 flex items-center gap-1">
@@ -411,16 +456,24 @@ export default function WorkspaceCalcular() {
                     </a>
                   )}
                   {destinoInput.trim() && !destinoGeoOk && (
-                    <p className="mt-1 text-[9px] text-amber-500 flex items-center gap-1">
-                      <AlertCircle size={8} className="shrink-0" /> Ajuste para "Cidade/UF" antes de calcular
-                    </p>
+                    <div className="mt-1 flex items-center gap-2">
+                      <p className="text-[9px] text-amber-500 flex items-center gap-1">
+                        <AlertCircle size={8} className="shrink-0" /> Ajuste para &quot;Cidade/UF&quot; antes de calcular
+                      </p>
+                      <button type="button"
+                        onClick={() => setDestinoInput(sanitizeLocalizacao(destinoInput, destinoLocalidade))}
+                        className="text-[9px] text-emerald-400 hover:text-emerald-300 font-semibold underline underline-offset-2 shrink-0"
+                      >
+                        Copiar Localização
+                      </button>
+                    </div>
                   )}
                 </div>
                 <div>
                   <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Produto</label>
                   <input type="text" value={produto} onChange={e => setProduto(e.target.value)}
                     placeholder="Ex: Soja em Grãos"
-                    className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700"
+                    className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700"
                   />
                 </div>
               </div>
@@ -470,7 +523,7 @@ export default function WorkspaceCalcular() {
               <div>
                 <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Categoria ANTT</label>
                 <select value={tipoCarga} onChange={e => setTipoCarga(e.target.value)}
-                  className="w-full bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500/60 appearance-none cursor-pointer"
+                  className="w-full bg-zinc-800 border border-zinc-700 text-zinc-300 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500/60 appearance-none cursor-pointer"
                 >
                   {TIPO_CARGA_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                 </select>
@@ -479,7 +532,7 @@ export default function WorkspaceCalcular() {
                 <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Preço Proposto (R$/t)</label>
                 <input type="number" value={precoTon} onChange={e => setPrecoTon(e.target.value)}
                   placeholder="0,00" min="0" step="0.01"
-                  className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-violet-500/60 placeholder-zinc-700 tabular-nums"
+                  className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-base font-semibold rounded-lg px-3 py-2 focus:outline-none focus:border-violet-500/60 placeholder-zinc-700 tabular-nums"
                 />
               </div>
             </section>
@@ -572,15 +625,15 @@ export default function WorkspaceCalcular() {
                           {margemPct != null ? `${margemPct.toFixed(1)}%` : '—'}
                         </span>
                       </div>
-                      <div className="flex items-end justify-between text-[10px]">
+                      <div className="flex items-end justify-between">
                         <div>
-                          <p className="text-zinc-600">Proposto</p>
-                          <p className="text-white font-mono font-bold">R$ {num(preco)}/t</p>
+                          <p className="text-[10px] text-zinc-600">Proposto</p>
+                          <p className="text-base text-white font-mono font-bold">R$ {num(preco)}/t</p>
                         </div>
                         {r.contrato.diferenca_por_ton != null && (
                           <div className="text-right">
-                            <p className="text-zinc-600">vs ANTT</p>
-                            <p className={`font-mono font-bold ${r.contrato.diferenca_por_ton >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                            <p className="text-[10px] text-zinc-600">vs ANTT</p>
+                            <p className={`text-base font-mono font-bold ${r.contrato.diferenca_por_ton >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                               {r.contrato.diferenca_por_ton >= 0 ? '+' : ''}R$ {num(r.contrato.diferenca_por_ton)}/t
                             </p>
                           </div>
@@ -621,7 +674,7 @@ export default function WorkspaceCalcular() {
                 </section>
 
                 {/* ── RAG INTELIGÊNCIA DE MERCADO ───────────────────────── */}
-                {(ragLoading || (ragData && ragData.total > 0)) && (
+                {(ragLoading || ragData) && (
                   <section className="flex flex-col gap-2 pb-4">
                     <p className="text-[10px] text-zinc-500 uppercase tracking-wide font-semibold flex items-center gap-1.5">
                       <Brain size={10} className="text-violet-400" /> Inteligência de Mercado
@@ -634,10 +687,24 @@ export default function WorkspaceCalcular() {
                       </div>
                     )}
 
-                    {!ragLoading && ragData && ragData.total > 0 && (() => {
+                    {!ragLoading && ragData && ragData.erro && (
+                      <div className="flex items-center gap-2 py-3 px-3 rounded-xl bg-red-950/40 border border-red-500/20">
+                        <AlertCircle size={12} className="text-red-400 shrink-0" />
+                        <span className="text-[11px] text-red-400 leading-relaxed">Erro ao buscar histórico: {ragData.erro}</span>
+                      </div>
+                    )}
+
+                    {!ragLoading && ragData && !ragData.erro && ragData.total === 0 && (
+                      <div className="flex items-center gap-2 py-3 px-3 rounded-xl bg-zinc-800/40">
+                        <Clock size={12} className="text-zinc-600 shrink-0" />
+                        <span className="text-[11px] text-zinc-600">Nenhum fechamento similar nos últimos 30 dias.</span>
+                      </div>
+                    )}
+
+                    {!ragLoading && ragData && !ragData.erro && ragData.total > 0 && (() => {
                       const top = ragData.resultados[0]
                       const media = ragData.resultados.reduce((s, r) => s + r.valor_tonelada, 0) / ragData.total
-                      const diasAtras = Math.round((Date.now() - new Date(top.data_fechamento).getTime()) / 86400000)
+                      const diasAtras = Math.round((ragAsOf - new Date(top.data_fechamento).getTime()) / 86400000)
                       const muitoSimilar = top.similaridade >= 0.85
 
                       return (
@@ -668,7 +735,7 @@ export default function WorkspaceCalcular() {
                           {/* Top 3 fechamentos similares */}
                           <div className="flex flex-col gap-1">
                             {ragData.resultados.slice(0, 3).map((r, i) => {
-                              const dias = Math.round((Date.now() - new Date(r.data_fechamento).getTime()) / 86400000)
+                              const dias = Math.round((ragAsOf - new Date(r.data_fechamento).getTime()) / 86400000)
                               return (
                                 <div key={r.id} className="rounded-lg bg-zinc-800/40 px-3 py-2 flex items-center justify-between gap-2">
                                   <div className="min-w-0">
@@ -679,7 +746,7 @@ export default function WorkspaceCalcular() {
                                       {r.produto}{r.tipo_veiculo ? ` · ${r.tipo_veiculo}` : ''} · {dias}d atrás
                                     </p>
                                   </div>
-                                  <span className="text-[11px] font-mono font-bold text-zinc-300 shrink-0">
+                                  <span className="text-sm font-mono font-bold text-zinc-300 shrink-0">
                                     R$ {num(r.valor_tonelada)}/t
                                   </span>
                                 </div>

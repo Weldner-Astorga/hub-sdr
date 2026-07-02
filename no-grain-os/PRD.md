@@ -198,9 +198,12 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 |---|-----------|--------|
 | M12 | Saneamento Status/SLA/Tipografia Radar — fix raiz do dropdown revertendo (Trizy usava tabela errada no PATCH) | ✅ 2026-07-01 |
 | M13 | Pipeline "Aguardando Resposta" (convive c/ roteamento por margem) + export geolocalizado (maps links no template de cópia) | ✅ 2026-07-01 |
-| M14 | Calculadora: RAG lateral + saneamento de endereço + mapa HD (bloqueado por dep `leaflet`/`@tremor` — ver Armadilhas) | Backlog |
+| M14 | Hotfix preço Trizy + `@tremor/react` removido (dep morta) + RAG (typo SQL em produção) + saneamento endereço + mapa dark HD | ✅ 2026-07-02 |
 | M15 | Ongo: view planilha + métricas de Aderência % + fechamento diário RAG | Backlog |
 | M16 | Gmail anti-ruído + triagem WhatsApp + card Liberações + botão `[Tratado]` | Backlog |
+
+### 🚨 Bloqueador crítico ativo (2026-07-02)
+`POST https://api.qualp.com.br/router/v4` → **404 Not Found** (ver `services/qualp_service.py:23`). Toda a Calculadora (`/torre/calcular/[id]`) está fora do ar — não foi causado por nenhuma mudança do M12-M14. Precisa investigação: token `QUALP_API_TOKEN` válido? QualP migrou de versão de API? Bloqueia validação visual completa do M14 (mapa/RAG/margem com rota real) e qualquer novo trabalho em precificação até resolver.
 
 ## 9.1 Backlog Priorizado (legado)
 
@@ -230,6 +233,7 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | Sheets 403 | Scope indevido | Sempre `spreadsheets.readonly` |
 | Evolution `groups_ignore: true` | Padrão ao criar instância | Setar `false` após criar |
 | GPT-4o-mini `nivel_confianca` não-determinístico | Temperatura do modelo | Não usar como gate de cotação |
-| `node_modules` sem `leaflet`/`@types/leaflet` instalados + conflito peer dep `@tremor/react` (React 18) vs `react@19.2.4` | `npm install` nunca rodado após adicionar `leaflet` ao `package.json`, ou rodado sem `--legacy-peer-deps` | Antes de M14: `npm install --legacy-peer-deps` (mesmo padrão já documentado para a VPS) |
 | Novo valor de `status` (ex.: `COTADO_AGUARDANDO`) pode causar 500 | `CHECK constraint` em `painel_fretes.status` (`m6_status_constraint.sql`) só aceita os 8 valores originais | Rodar migration adicionando o valor ao constraint antes de gravar `COTADO_AGUARDANDO` diretamente |
-| "Salvar Preço Proposto" falha silenciosamente pra cotações Trizy no Workspace | `PATCH /cotacoes/{id}/preco` só atualiza `painel_fretes` (coluna `id` é `uuid`); ids Trizy não são uuid | Aplicar o mesmo fallback Trizy que `/status` já tem (M12), mapeando pra coluna `valor_proposto_ton` |
+| **QualP `router/v4` retorna 404 (ATIVO, 2026-07-02)** | API externa QualP — não é o app; ver `services/qualp_service.py:23` | Investigar `QUALP_API_TOKEN` e se a QualP mudou versão/contrato da API antes de tocar na calculadora |
+| RPC do Supabase diverge do `.sql` local no repo | Alguém editou a função direto no SQL Editor sem atualizar o arquivo versionado (aconteceu com `buscar_fretes_similares`: `data_limite`→`data_limi`) | Sem acesso Postgres direto nem `exec_sql` RPC — reaplicar o `CREATE OR REPLACE FUNCTION` do `.sql` local manualmente no SQL Editor quando suspeitar de divergência |
+| Login automatizado no Supabase Studio via Puppeteer | CAPTCHA anti-bot bloqueia (não contornar) | Pedir para o usuário rodar SQL manualmente, ou usar credenciais de API/DB direto quando disponíveis |
