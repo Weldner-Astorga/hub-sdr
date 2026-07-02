@@ -1,7 +1,7 @@
 # NO GRAIN OS — Milestones
 
-**Última atualização:** 2026-06-30  
-**Versão:** 3.0  
+**Última atualização:** 2026-07-02  
+**Versão:** 3.1  
 **Ambiente:** VPS `2.24.201.246` | Backend :8000 | Frontend :3000
 
 ---
@@ -265,16 +265,225 @@ O achado do M14 ("bloqueia TODA a calculadora") tinha duas causas empilhadas, n�
 
 **Conclusão:** M14 está 100% validado visualmente agora — o bloqueador que impedia a confirmação completa foi removido no mesmo dia.
 
-### M15 — Módulo Ongo Planilha + Aderência + RAG Diário (Backlog)
-- View em modo planilha ao clicar no card Ongo (187 registros), com filtros e agrupamento por município
-- Painel de totais: TOTAL DE LOTES, TOTAL CADENCIA, TOTAL ACIONADO, Aderência % = Acionado/Cadência×100
-- Rotina de fechamento diário → compacta em histórico consolidado para alimentar RAG da calculadora
+### M15 — Dashboard Ongo Cargas (Frete Geral Ongo) ✅
+**Entregue:** 2026-07-02
+
+**Contexto:** o card "FRETE GERAL ONGO" na Torre não abria nada dentro do app — era um `<a href>` puro pro Google Sheets externo. Não existia grid/dashboard in-app nem tabela no Supabase com os dados do Ongo Geral; `extract_ongo.py` só escrevia no Sheets. Também já existia um plano documentado nunca executado (`integrations/octamove-core/ongo_script_progress.md`) para fechamento diário 23:55 + Task Scheduler.
+
+**Decisão de escopo (ajustada pelo usuário em runtime):** a proposta inicial tinha um cabeçalho com TOTAL CADÊNCIA / TOTAL ACIONADO / Aderência % (replicando o modelo antigo de "Aderência Transportadoras" do `ongo_script_progress.md`, com score de confiabilidade por transportadora). O usuário simplificou para **TOTAL DE LOTES / VOLUME LIBERADO TOTAL / SALDO RESTANTE DO DIA** — métricas mais diretas, sem breakdown por transportadora/check-in/reagendamento (essa ideia mais rica fica só documentada em `project_ongo_script.md` como backlog, não implementada).
+
+**Banco (`backend/ongo_geral_migration.sql`):**
+- Nova tabela `public.cargas_ongo` (`link_id_carga UNIQUE`, `municipio_origem`, `terminal_origem`, `origem`, `destino`, `produto`, `quantidade_kg`, `saldo_restante_kg`, `valor_proposto_ton`, `status`) — sincronizada a cada ciclo do extrator.
+- **Sem tabela nova para o fechamento diário** — decisão deliberada: o RAG do precificador (`historico_fechamentos` + RPC `buscar_fretes_similares`, do M8) já é o motor que a calculadora consulta por similaridade de rota; uma tabela paralela não seria vista por ele. O fechamento do Ongo Geral escreve direto em `historico_fechamentos`.
+
+**`extract_ongo.py` (raiz, script local Windows):**
+- `_upsert_cargas_ongo()` — novo, chamado em `run_cycle()` logo após `_push_to_sheets()`; upsert real via `on_conflict="link_id_carga"` (a coluna já é UNIQUE, diferente de `painel_fretes.gmail_message_id` que precisou do workaround de check-antes-de-inserir no M17.2).
+- `_generate_schema()` atualizado pra bater com a migração nova (estava desatualizado, sem município/terminal).
+
+**Novo `fechamento_ongo_diario.py`:** agrega Volume Liberado × Saldo Restante por rota+produto a partir do estado atual de `cargas_ongo`, gera embedding (`text-embedding-3-small`, mesmo `_montar_texto` do `rag_service.py`) e insere em `historico_fechamentos` — replica o corpo de `indexar_fechamento()` localmente (script standalone, sem importar do backend FastAPI). Trava defensiva de divisão por zero aplicada em qualquer razão calculada.
+
+**Agendamento:** `run_ongo_diario.bat` (`run_ongo_once.py` + `fechamento_ongo_diario.py`) + Task Scheduler Windows `OctamoveOngo_Diario` às 23:55 — registrado **sem** `-RunLevel Highest` (deu "Acesso negado" sem elevação; roda como usuário comum, suficiente).
+
+**Frontend (`frontend-torre`):**
+- `types/carga.ts`: novo tipo `CargaOngoGeral` (não reaproveita `CargaLogistica` — campos não batem).
+- `app/api/ongo-geral/route.ts`: mesmo padrão REST cru contra o PostgREST do `trizy/cotacoes/route.ts` (sem SDK, `fetch` direto com `apikey`/`Authorization`).
+- `app/page.tsx`: card `ongo_geral` trocado de `<a href={SHEET_URL}>` pra `<button onClick={() => setOngoGeralOpen(true)}>`; novo modal `OngoGeralModal` (não é o drawer lateral 480/720px dos outros — modal grande centralizado `inset-4 md:inset-10`, já que o conteúdo é uma planilha densa) com:
+  - Bloco de resumo real-time (3 células, recalculado via `useMemo` a partir das linhas **filtradas**)
+  - Filtros dinâmicos (Município Origem / Terminal Origem / Empresa) — `<select>` com opções únicas derivadas das linhas
+  - Grid com o mesmo design system das outras tabelas (header sticky, `text-[10-11px]`, `tabular-nums font-mono`)
+  - Botão **"Abrir planilha"** no cabeçalho do modal (mantém acesso ao Google Sheets original — pedido explícito do usuário depois do primeiro teste, pra não perder a opção antiga)
+
+**Bug corrigido — card zerado até o primeiro clique:** `ongoGeralRows` só era buscado num `useEffect` gatilhado por `ongoGeralOpen`, então o card mostrava contagem 0 até o usuário abrir o modal pela primeira vez. Fix: fetch de `/api/ongo-geral` movido pro mesmo efeito de polling do Trizy (`fetchTrizy`, a cada 10s desde o mount), igual ao padrão já usado por `trizyCount`/`trizyCotacoes` — agora o card já mostra o número certo assim que a página carrega.
+
+**Dois bugs pré-existentes descobertos e corrigidos no processo (bloqueavam a primeira execução real do script, não relacionados à feature em si):**
+1. Console Windows usa `cp1252` por padrão fora de um terminal UTF-8 real — `extract_ongo.py` tem vários `print()` com `→`/emojis que derrubavam o processo com `UnicodeEncodeError` (isso também quebraria o cron das 23:55 ao redirecionar output pro log via `.bat`). Fix: `sys.stdout/stderr.reconfigure(encoding="utf-8", errors="replace")` no topo do módulo.
+2. `.env` raiz tinha `GOOGLE_CREDENTIALS_PATH=octamove-core/credentials.json google sheets.json` (relativo a `C:\Users\Dell`), mas o arquivo real está em `no-grain-os/integrations/octamove-core/`. Path errado fazia `_sheets_client()` chamar `sys.exit(1)` antes de chegar no upsert do Supabase. Fix: path corrigido no `.env`.
+
+**Armadilha de migração:** a primeira tentativa de rodar `ongo_geral_migration.sql` no Supabase SQL Editor deu `syntax error at or near "CREATE"` — causa provável: caracteres decorativos não-ASCII nos comentários (`═`, `──`, acentos) corrompidos no copiar/colar pro editor web. Reescrito em ASCII puro (sem acentos/box-drawing) e rodou sem erro na segunda tentativa.
+
+**Validado:**
+- `npm run build` limpo (tipagem + 13 rotas geradas)
+- Testado no navegador via Puppeteer com dados mockados (fetch interceptado) antes de ter dados reais: modal abre, resumo calcula certo, filtro recalcula os 3 totais instantaneamente
+- Migração aplicada em produção pelo usuário; `run_ongo_once.py` rodado manualmente após os 2 fixes — **171 lotes reais sincronizados em `cargas_ongo`**, confirmado via `Content-Range` do PostgREST
+- Deploy na VPS (`deploy_vps.py`) feito 2x (feature completa + fix do card zerado), health check OK nas duas vezes, `curl` em produção confirmou dados reais servidos por `http://2.24.201.246:3000/api/ongo-geral`
+
+**Pendente (backlog, não bloqueia M15):** Task Scheduler roda **local no Windows** do usuário, não na VPS — o fechamento das 23:55 depende do notebook estar ligado nesse horário. Breakdown por transportadora (check-in/reagendamento/score) do plano original não foi implementado — ver `project_ongo_script.md`.
 
 ### M16 — Ingestão Avançada: Gmail Anti-Ruído + Triagem WhatsApp (Backlog)
 - Filtro classificador Gmail (RAG de triagem) — só Cotações de Frete e Liberações de Embarque
 - Card WhatsApp com volumetria tipificada: `Total X — Informações Y — Cotações Z`
 - Parser de "Embarque Liberado" (BTG/Ricelly) → card/campo "Liberações" estruturado
 - Botão `[Tratado]` no Radar WhatsApp — oculta da fila visual, mantém arquivado no banco
+
+### M17 — Precisão Geográfica: Ponto Exato no QualP ✅
+**Entregue:** 2026-07-02
+**Gatilho:** BID Trizy 00067487 — rota Brasnorte/MT → Campos de Júlio/MT deu **800+ km** na
+calculadora contra **293 km** reais no Google Maps (endereço completo: Usimat MT-388 →
+Fazenda Tricolor). Reproduzido manualmente digitando os mesmos endereços direto no site do
+QualP: **348 km** — provando que a API geocodifica endereço completo normalmente; o motivo do
+erro estava 100% no nosso código, que descartava o nome do local antes de mandar pro QualP.
+
+**Causa raiz:**
+- `frontend-torre/app/api/trizy/cotacoes/route.ts` (`mapRow()`) montava `origem`/`destino`
+  priorizando **só** `Cidade/UF`, descartando `entidade_origem`/`ponto_coleta_nome` (o nome do
+  local: "Usimat", "Fazenda Tricolor").
+- `sanitizeLocalizacao()` no frontend reforçava esse truncamento, mesmo quando o texto mais
+  detalhado já estava disponível.
+- O link "Ver ponto exato no Maps" da Trizy (`localizacao_origem_link`) não é um pin fixo — é
+  uma URL de **busca** (`google.com/maps/search/{texto}`) sem coordenada embutida; o texto que
+  ela carrega já está salvo cru nos campos `local_coleta_full`/`entidade_origem_trizy`.
+
+**Milestone A — Motor (backend):**
+- `services/qualp_service.py`: extraída `_chamar_qualp()` (POST puro, sem cache); `consultar_rota()`
+  ganhou `origem_fallback`/`destino_fallback` opcionais — se a chamada com ponto exato falhar
+  (erro HTTP ou `distancia_km <= 0`), refaz automaticamente com a Cidade/UF de fallback e retorna
+  `aviso: "Ponto exato indisponível no QualP. Calculando pela sede do município."`. Assinatura
+  100% retrocompatível (params novos são opcionais, comportamento antigo inalterado sem eles).
+- `routers/precificar.py`: `PrecificarRequest` ganhou `origem_ponto_exato`/`destino_ponto_exato`
+  (texto "Nome do Local, Cidade/UF"), `origem_maps_link`/`destino_maps_link` e `origem_lat/lng`
+  `destino_lat/lng`. `_resolver_ponto_exato()` decide o que mandar pro QualP com prioridade:
+  coordenada já geocodificada (Ongo/WhatsApp/Gmail via `coords_coleta_lat/lng`) → coordenada
+  extraída do link do Maps (reaproveita `services/location_parser.extrair_coords()`, raro dar
+  match na Trizy) → texto do ponto exato (o que resolveu o caso real: 800km → ~348km).
+- Response `rota` agora inclui `aviso` (null em cálculo normal).
+
+**Milestone B — UX (frontend, `app/torre/calcular/[id]/page.tsx`):**
+- Campos "Origem"/"Destino" continuam só os dois de sempre — sem inputs novos. Por padrão
+  seguem preenchidos com `Cidade/UF` limpa via `sanitizeLocalizacao()` (comportamento inalterado).
+- Badge `🏢 {nome do local} · ⚡ Usar Ponto Exato` abaixo de cada campo, só quando a cotação tem
+  `origem_localidade`/`destino_localidade` (Trizy) ou coordenada (`coords_coleta_lat/lng`, quando
+  a fonte for Ongo/WhatsApp/Gmail). Sem dado específico, a linha some — zero poluição visual.
+  Clicar reescreve o input pra `"Nome do Local, Cidade/UF"` e vira `✓ Ponto Exato Ativo` (verde).
+  Clicar de novo volta pra Cidade/UF. Campo continua 100% editável — o estado "ativo" é
+  *derivado* (`input === texto do ponto exato`), não uma flag separada, então editar o texto à
+  mão desativa o modo automaticamente, sem dessincronizar.
+- `calcular()` manda a Cidade/UF congelada (`origemCidadeUfBase`) como fallback junto com o
+  payload de ponto exato; toast automático se o backend devolver `aviso`.
+
+**Validação:**
+- `_resolver_ponto_exato()` testado isoladamente: prioriza coords explícitas → coords do link →
+  texto → `None`. Confirmado com os 4 casos (coords, link sem coord, link com coord `/@lat,lng`,
+  nada disponível).
+- `consultar_rota()` testado ao vivo contra Supabase real (cache hit e caminho `sem_token`) —
+  novas chaves `origem_usada`/`destino_usada`/`aviso` presentes e corretas nos dois caminhos, sem
+  quebrar o fluxo antigo. Fallback contra geocodificação real não testado localmente por falta de
+  `QUALP_API_TOKEN` no `.env` local (vazio) — validar na VPS, que tem o token de produção.
+- `npx tsc --noEmit` limpo e `npm run build` (Next.js/Turbopack) compilou as 12 rotas sem erro.
+
+**Deploy validado (2026-07-02):** VPS testada ao vivo via Puppeteer na cotação 00067487 real —
+badge funcionando, mapa renderizando rota real, 278km (vs. 800+km antes). No caminho, achado e
+corrigido bug separado no `deploy_vps.py`: `FRONTEND_ENV` sobrescrevia o `.env.local` sem as
+chaves do Supabase a cada deploy, quebrando `/api/trizy/cotacoes` silenciosamente.
+
+**Investigação do gap QualP (278km) vs. teste manual no site do QualP (348km):** testado
+`type_route` (`efficient/shorter/shortest/faster/fastest/cheaper/cheapest`) direto contra a API
+real — **não é a causa**, todos retornam ~278km. Testado também variar `axis` (2 a 9) e pedir
+`alternative_routes` — QualP só considera uma rota "boa" pra essas coordenadas, nada muda.
+Causa real, confirmada inspecionando `coordenada_inicio`/`coordenada_fim` da resposta: o QualP
+**nunca geocodifica "Fazenda Tricolor"** — em 3 tentativas de texto diferentes (com e sem CEP),
+a coordenada de origem voltou **idêntica** (`-12.12927,-57.99804`, o centro do município de
+Brasnorte). O QualP não tem propriedades rurais privadas no gazetteer dele; cai pro centro da
+cidade silenciosamente, sem erro. Já "Usimat" (uma cooperativa real) o QualP acha, mas com
+precisão instável dependendo do texto — `"USIMAT, MT-388"` (com referência de rodovia) reproduziu
+exatamente os 348km do teste manual.
+
+### M17.1 — Google Geocoding: tentado e abortado (restrição de billing) ❌
+**Tentativa:** 2026-07-02
+
+Implementado, testado e deployado (`services/google_geocoding_service.py` +
+`_resolver_ponto_exato()` async com etapa extra de geocodificação). Chave gerada pelo cliente
+(`GOOGLE_API_KEY`) testada local e na VPS — Google respondeu `REQUEST_DENIED`
+("The provided API key is invalid.") nos dois ambientes, confirmando que não é problema de
+rede/IP e sim de configuração no Google Cloud Console (Geocoding API não habilitada e/ou billing
+não vinculado ao projeto). **Abortado a pedido do cliente** por restrição de billing no Console.
+
+**Revertido por completo em 2026-07-02:** removido `services/google_geocoding_service.py`,
+`GOOGLE_API_KEY` de `core/config.py`/`.env`/`deploy_vps.py`, e a etapa de geocoding em
+`_resolver_ponto_exato()` (voltou a ser síncrona: coordenada explícita → coordenada do link do
+Maps → texto cru pro QualP). Estrutura da M17 (badge "Usar Ponto Exato" + fallback pra Cidade/UF)
+permanece 100% ativa e funcional em produção, sem a etapa de satélite.
+
+### M17.2 — Fix: cotações do Gmail paravam de ser gravadas (perda silenciosa) ✅
+**Entregue:** 2026-07-02
+
+**Sintoma:** enquanto investigava o M17.1, os logs de erro da VPS mostraram um erro recorrente
+em toda tentativa de inserção via Gmail: `there is no unique or exclusion constraint matching
+the ON CONFLICT specification` (Postgres `42P10`).
+
+**Causa raiz (duas, compostas):**
+1. `services/supabase_writer.py::inserir_frete()` usava
+   `.upsert(row, on_conflict="gmail_message_id")`, que exige um índice UNIQUE na coluna
+   `gmail_message_id` da tabela `painel_fretes` pro Postgres saber resolver o conflito. Esse
+   índice **nunca foi aplicado em produção** — existe uma migration pronta pra isso
+   (`migrations/fix_gmail_dedup.sql`, "roda uma vez no Supabase dashboard ou via psql") que
+   ninguém rodou. Resultado: toda gravação via Gmail falhava com 400.
+2. `services/gmail_service.py::poll_gmail_fretes()` marcava a mensagem como processada
+   (`novos_ids.add(msg_id)`) **mesmo quando a gravação falhava** (não checava se
+   `registro_id` veio `None`) — cada cotação que caía no erro acima era silenciosamente
+   descartada pra sempre, sem nunca ser salva e sem nunca ser retentada.
+3. **Agravante:** `deploy_vps.py` sobrescrevia `processed_gmail_ids.json` com `[]` a cada
+   deploy — isso derrubava até esse dedup local, causando picos de reprocessamento (e
+   consequentemente picos do erro 42P10) toda vez que alguém rodava um deploy.
+
+**Correções aplicadas** (sem precisar de migration/acesso direto ao Postgres — só reescreveu a
+lógica de gravação pra não depender da constraint ausente):
+- [x] `services/supabase_writer.py`: trocado `upsert(on_conflict=...)` por
+      checa-antes-de-inserir (`SELECT id WHERE gmail_message_id=eq...` → se existir, retorna o
+      id existente sem tentar inserir de novo; senão, `INSERT` normal). Testado localmente
+      contra o Supabase real: 1ª inserção cria linha, 2ª com o mesmo `gmail_message_id`
+      deduplicada sem erro. Linha de teste removida depois.
+- [x] `services/gmail_service.py`: só marca a mensagem como processada quando `registro_id`
+      não é `None`; falha de gravação agora conta como erro e a mensagem é **retentada no
+      próximo ciclo** (1min) em vez de ser perdida pra sempre.
+- [x] `deploy_vps.py`: `processed_gmail_ids.json` só é criado se não existir
+      (`test -f ... || echo '[]' > ...`), não sobrescreve mais o dedup a cada deploy.
+- [x] **Recuperação das cotações perdidas:** resetado `processed_gmail_ids.json` uma vez (ação
+      manual, pós-fix) pra forçar reprocessamento das 8 mensagens que tinham ficado marcadas
+      como processadas sem nunca terem sido salvas. Resultado no ciclo seguinte:
+      `injetados: 7, ignorados: 0, erros: 0` — as 7 cotações reais (1 já tinha sido recuperada
+      no ciclo anterior) confirmadas como linhas novas em `painel_fretes` com
+      `gmail_message_id` preenchido.
+- [x] Deploy VPS validado, backend/frontend online, health check OK, ciclos subsequentes do
+      scheduler (1min) rodando limpos sem erro.
+
+### M17.3 — Migration `fix_gmail_dedup.sql` aplicada em produção ✅
+**Entregue:** 2026-07-02
+
+Rodada pelo cliente via Supabase Dashboard → SQL Editor (sem acesso direto a Postgres/Management
+API disponível — nenhuma connection string ou personal access token `sbp_...` encontrado no
+projeto; opção escolhida foi rodar manualmente em vez de compartilhar mais credenciais).
+
+**Validação (com alguns falsos negativos pelo caminho, documentados aqui pra não confundir uma
+próxima investigação):**
+- 1ª tentativa de validar via `upsert(on_conflict="gmail_message_id")` → continuou dando
+  `42P10`. Não é bug da migration: o índice criado é **parcial**
+  (`WHERE gmail_message_id IS NOT NULL`), e o mecanismo de upsert do PostgREST gera
+  `ON CONFLICT (coluna) DO UPDATE` sem o predicado `WHERE` — Postgres exige que o predicado do
+  `ON CONFLICT` bata exatamente com o do índice parcial pra usá-lo como alvo. Limitação conhecida
+  do PostgREST com índices parciais, não afeta o código em produção (que não usa mais upsert).
+- 1º teste de `INSERT` duplicado direto (sem `on_conflict`) → passou (201), parecendo indicar que
+  o índice não existia. Era falso negativo: a linha-alvo da duplicata (`gmail_message_id` da
+  cotação "DDG Milho" recuperada em M17.2) já tinha sido removida por uma re-execução do Passo 3
+  da própria migration (limpeza de duplicatas históricas) entre um teste e outro.
+- Usuário confirmou via `SELECT indexname, indexdef FROM pg_indexes WHERE tablename=
+  'painel_fretes' AND indexname='painel_fretes_gmail_message_id_key'` que o índice existe.
+- Teste definitivo — duplicar uma linha confirmada existente no instante do teste → rejeitado
+  corretamente: `HTTP 409, code 23505: duplicate key value violates unique constraint
+  "painel_fretes_gmail_message_id_key"`. **Índice único confirmado ativo e aplicado pelo
+  Postgres.**
+- Linhas de teste (`TESTE DUP/MT`, `TESTE DUP2/MT`) removidas do banco após cada verificação.
+
+**Efeito colateral observado (esperado, não é bug):** o Passo 3 da migration (limpeza de
+duplicatas históricas por `fonte_ingestao+embarcador+produto+origem+destino`, mantém a linha mais
+antiga) rodou mais de uma vez durante a investigação e removeu 5 das 7 linhas recuperadas em
+M17.2 por serem duplicatas de cotações antigas já existentes (de antes do fix, sem
+`gmail_message_id`) — a linha mais antiga sobreviveu com os mesmos dados de negócio (origem,
+destino, produto), só sem o vínculo daquele `gmail_message_id` específico. Sem perda de
+informação comercial; sobraram 2 das 7 linhas com `gmail_message_id` preenchido.
+
+**Estado final:** dedup em duas camadas — aplicação (`supabase_writer.py`, checa-antes-de-inserir)
++ banco (índice único parcial, agora como defesa contra concorrência real). Sistema de ingestão
+Gmail validado de ponta a ponta.
 
 ---
 
@@ -286,8 +495,8 @@ O achado do M14 ("bloqueia TODA a calculadora") tinha duas causas empilhadas, n�
 | M10 | Trizy — Token auto-renovação Task Scheduler | Agendar `trizy_login.py` diário para manter sessão ativa | Alta |
 | M10 | Trizy — Alerta WhatsApp | Enviar mensagem via Evolution API quando novo BID chega com produto/rota de interesse | Alta |
 | M11 | Trizy — CRM N8N | Workflow N8N que lê `status_crm` e dispara ações (resposta, acompanhamento) | Média |
-| — | Ongo Task Scheduler | Rodar `extract_ongo.py` automaticamente às 23:55 via Windows Task Scheduler | Alta |
-| — | Ongo Aba Aderência | Implementar aba "Aderência Transportadoras" no `extract_ongo.py` | Média |
+| — | Ongo Aba Aderência | Implementar aba "Aderência Transportadoras" (check-in/reagendamento/score por transportadora) no `extract_ongo.py` — ver M15 | Média |
+| — | Ongo Task Scheduler na VPS | Hoje roda local no Windows do usuário; migrar pra cron na VPS tornaria o fechamento 23:55 independente do notebook estar ligado | Média |
 | — | Adicionar grupos de frete reais | Incluir grupos como "Fretes MT", "APCAM FRETES", "Fretes Rondonópolis" no `GRUPOS_PERMITIDOS` | Média |
 | — | Popular `historico_fechamentos` | Importar fechamentos históricos reais para ativar RAG com dados reais | Média |
 | — | Notificações push | Alerta sonoro/visual quando nova cotação chega na Torre | Baixa |
@@ -304,4 +513,6 @@ O achado do M14 ("bloqueia TODA a calculadora") tinha duas causas empilhadas, n�
 | `npm install` falha na VPS | Conflito peer deps React 19 + tremor | Usar `--legacy-peer-deps` |
 | Sheets 403 | Scope indevido | Sempre `spreadsheets.readonly` |
 | Evolution `groups_ignore: true` | Padrão ao criar nova instância | Sempre setar `groups_ignore: false` após criar |
+| Calculadora dava 800+km em rotas curtas | Premissa errada de que "QualP só geocodifica Cidade/UF" — código descartava nome do local (fazenda/terminal) antes de mandar pro QualP, que geocodificava a sede do município ao invés do ponto real | M17: mandar `"Nome do Local, Cidade/UF"` ou lat/lng; QualP geocodifica endereço completo normalmente (testado manualmente: 348km vs 800+km) |
+| Link "Ver ponto exato no Maps" da Trizy não tem coordenada | `localizacao_origem_link` é uma URL de **busca** (`/maps/search/{texto}`), não um pin — não confundir com link de Gmail/WhatsApp que pode ter `/@lat,lng` ou `!3d!4d` | Usar o texto cru (`local_coleta_full`/`entidade_origem_trizy`) direto, sem tentar parsear coordenada desse link específico |
 | GPT-4o-mini `nivel_confianca` não-determinístico | Temperatura do modelo | Não usar `nivel_confianca` como gate de cotação |

@@ -9,7 +9,7 @@ import {
   Eye, ArrowUpRight, Loader2, Trophy, XCircle, Calculator,
   Radio, Bell, Truck, Send,
 } from 'lucide-react'
-import type { CargaLogistica, ApiResponse, FonteIngestao, StatusCotacao } from '@/types/carga'
+import type { CargaLogistica, ApiResponse, FonteIngestao, StatusCotacao, CargaOngoGeral } from '@/types/carga'
 
 // ─── Constants ─────────────────────────────────────────────────────────────────
 
@@ -81,6 +81,10 @@ function formatBRL(v: number | null | undefined): string {
 
 function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function fmtKg(v: number | null | undefined): string {
+  return new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 0 }).format(v ?? 0)
 }
 
 function trunc(str: string | null | undefined, max: number): string {
@@ -250,7 +254,7 @@ function FonteCard({ fonte, count, lastUpdate, onClick, active }: {
       <div className="relative flex items-center justify-between">
         <div className={`p-2 rounded-lg bg-zinc-800 ${cfg.iconCls}`}><cfg.Icon size={16} /></div>
         <div className="flex items-center gap-2">
-          {isOngo     && <ExternalLink size={11} className="text-violet-400/60" />}
+          {isOngo     && <Eye size={11} className="text-violet-400/60" />}
           {isWhatsApp && <Bell size={11} className="text-emerald-400/60" />}
           <div className="flex items-center gap-1.5">
             <span className={`w-1.5 h-1.5 rounded-full ${cfg.dotCls} animate-pulse`} />
@@ -270,7 +274,7 @@ function FonteCard({ fonte, count, lastUpdate, onClick, active }: {
       </div>
     </div>
   )
-  if (isOngo)     return <a href={SHEET_URL} target="_blank" rel="noopener noreferrer" className="block group">{inner}</a>
+  if (isOngo)     return <button type="button" onClick={onClick} className="block text-left w-full">{inner}</button>
   if (isWhatsApp) return <button type="button" onClick={onClick} className="block text-left w-full">{inner}</button>
   if (isTrizy)    return <button type="button" onClick={onClick} className="block text-left w-full">{inner}</button>
   return inner
@@ -812,6 +816,182 @@ function RadarWhatsAppTimeline({
   )
 }
 
+// ─── Modal Frete Geral Ongo (M15) ───────────────────────────────────────────────
+
+function OngoGeralModal({
+  open, onClose, rows, loading,
+}: {
+  open: boolean; onClose: () => void
+  rows: CargaOngoGeral[]; loading: boolean
+}) {
+  const [filtroMunicipio, setFiltroMunicipio] = useState('')
+  const [filtroTerminal,  setFiltroTerminal]  = useState('')
+  const [filtroEmpresa,   setFiltroEmpresa]   = useState('')
+
+  const municipios = useMemo(() => Array.from(new Set(rows.map(r => r.municipio_origem).filter(Boolean))).sort(), [rows])
+  const terminais  = useMemo(() => Array.from(new Set(rows.map(r => r.terminal_origem).filter(Boolean))).sort(), [rows])
+  const empresas   = useMemo(() => Array.from(new Set(rows.map(r => r.empresa).filter(Boolean))).sort(), [rows])
+
+  // Bloco de resumo recalcula em tempo real a partir das linhas filtradas
+  const filtradas = useMemo(() => rows.filter(r =>
+    (!filtroMunicipio || r.municipio_origem === filtroMunicipio) &&
+    (!filtroTerminal  || r.terminal_origem  === filtroTerminal) &&
+    (!filtroEmpresa   || r.empresa          === filtroEmpresa)
+  ), [rows, filtroMunicipio, filtroTerminal, filtroEmpresa])
+
+  const totalLotes          = filtradas.length
+  const volumeLiberadoTotal = useMemo(() => filtradas.reduce((s, r) => s + (r.quantidade_kg || 0), 0), [filtradas])
+  const saldoRestanteTotal  = useMemo(() => filtradas.reduce((s, r) => s + (r.saldo_restante_kg || 0), 0), [filtradas])
+
+  const filtroAtivo   = !!(filtroMunicipio || filtroTerminal || filtroEmpresa)
+  const limparFiltros = () => { setFiltroMunicipio(''); setFiltroTerminal(''); setFiltroEmpresa('') }
+
+  return (
+    <>
+      <div
+        className={`fixed inset-0 bg-zinc-950/70 backdrop-blur-sm z-40 transition-opacity duration-300 ${open ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}
+        onClick={onClose}
+      />
+      <div className={`fixed inset-4 md:inset-10 z-50 bg-zinc-900 border border-violet-500/30 rounded-xl shadow-2xl flex flex-col transition-all duration-300 ${open ? 'opacity-100 scale-100' : 'opacity-0 scale-95 pointer-events-none'}`}>
+
+        {/* Cabeçalho */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800 shrink-0">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 rounded-lg bg-violet-500/10"><BarChart3 size={14} className="text-violet-400" /></div>
+            <div>
+              <p className="text-sm font-semibold text-white">Frete Geral Ongo</p>
+              <p className="text-[11px] text-zinc-500">Planilha integrada · fretes gerais</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            {loading && <Loader2 size={14} className="text-zinc-500 animate-spin" />}
+            <a
+              href={SHEET_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 text-[11px] font-medium px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
+            >
+              <ExternalLink size={11} /> Abrir planilha
+            </a>
+            <button onClick={onClose} className="text-zinc-600 hover:text-zinc-300 transition-colors p-1.5 rounded-lg hover:bg-zinc-800">
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+
+        {/* Corpo scrollável */}
+        <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
+
+          {/* Bloco de resumo — real-time, recalcula com os filtros */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 shrink-0">
+            <div className="bg-zinc-800/60 border border-zinc-800 rounded-xl px-4 py-3">
+              <p className="text-[10px] text-zinc-500 uppercase tracking-wide font-medium mb-1">Total de Lotes</p>
+              <p className="text-2xl font-bold text-white tabular-nums">{totalLotes}</p>
+            </div>
+            <div className="bg-emerald-500/10 border border-emerald-500/30 rounded-xl px-4 py-3">
+              <p className="text-[10px] text-emerald-400/80 uppercase tracking-wide font-medium mb-1">Volume Liberado Total</p>
+              <p className="text-2xl font-bold text-emerald-300 tabular-nums">{fmtKg(volumeLiberadoTotal)} kg</p>
+            </div>
+            <div className="bg-orange-500/10 border border-orange-500/30 rounded-xl px-4 py-3">
+              <p className="text-[10px] text-orange-400/80 uppercase tracking-wide font-medium mb-1">Saldo Restante do Dia</p>
+              <p className="text-2xl font-bold text-orange-300 tabular-nums">{fmtKg(saldoRestanteTotal)} kg</p>
+            </div>
+          </div>
+
+          {/* Filtros dinâmicos */}
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 shrink-0">
+            <div>
+              <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Município Origem</label>
+              <select
+                value={filtroMunicipio}
+                onChange={e => setFiltroMunicipio(e.target.value)}
+                className="w-full bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs rounded-lg px-3 py-2.5 focus:outline-none focus:border-violet-500/60 appearance-none cursor-pointer"
+              >
+                <option value="">Todos os municípios</option>
+                {municipios.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Terminal Origem</label>
+              <select
+                value={filtroTerminal}
+                onChange={e => setFiltroTerminal(e.target.value)}
+                className="w-full bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs rounded-lg px-3 py-2.5 focus:outline-none focus:border-violet-500/60 appearance-none cursor-pointer"
+              >
+                <option value="">Todos os terminais</option>
+                {terminais.map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Empresa / Embarcador</label>
+              <select
+                value={filtroEmpresa}
+                onChange={e => setFiltroEmpresa(e.target.value)}
+                className="w-full bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs rounded-lg px-3 py-2.5 focus:outline-none focus:border-violet-500/60 appearance-none cursor-pointer"
+              >
+                <option value="">Todas as empresas</option>
+                {empresas.map(emp => <option key={emp} value={emp}>{emp}</option>)}
+              </select>
+            </div>
+            <div className="flex items-end">
+              {filtroAtivo && (
+                <button
+                  onClick={limparFiltros}
+                  className="text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors px-3 py-2.5 rounded-lg border border-zinc-800 hover:border-zinc-700"
+                >
+                  Limpar filtros
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Grid */}
+          <div className="border border-zinc-800 rounded-xl overflow-auto flex-1">
+            <table className="w-full text-[11px]">
+              <thead className="bg-zinc-900 sticky top-0 z-10">
+                <tr>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Empresa</th>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Município Origem</th>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Terminal Origem</th>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Origem → Destino</th>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Produto</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Volume Liberado (kg)</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Saldo Restante (kg)</th>
+                  <th className="px-3 py-2 text-right text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Valor R$/T</th>
+                  <th className="px-3 py-2 text-left text-[10px] font-semibold text-zinc-500 uppercase tracking-wider">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtradas.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="px-3 py-10 text-center text-zinc-600 text-xs">
+                      {loading ? 'Carregando lotes...' : 'Nenhum lote encontrado para os filtros aplicados.'}
+                    </td>
+                  </tr>
+                ) : filtradas.map(r => (
+                  <tr key={r.link_id_carga || r.id} className="border-b border-zinc-800/40 hover:bg-zinc-800/30">
+                    <td className="px-3 py-2 whitespace-nowrap text-zinc-300">{r.empresa || '—'}</td>
+                    <td className="px-3 py-2 whitespace-nowrap text-zinc-400">{r.municipio_origem || '—'}</td>
+                    <td className="px-3 py-2 whitespace-nowrap text-zinc-400">{r.terminal_origem || '—'}</td>
+                    <td className="px-3 py-2 whitespace-nowrap text-zinc-400">{r.origem} → {r.destino}</td>
+                    <td className="px-3 py-2 whitespace-nowrap text-zinc-400">{r.produto || '—'}</td>
+                    <td className="px-3 py-2 whitespace-nowrap text-right text-zinc-300 tabular-nums font-mono">{fmtKg(r.quantidade_kg)}</td>
+                    <td className="px-3 py-2 whitespace-nowrap text-right text-zinc-300 tabular-nums font-mono">{fmtKg(r.saldo_restante_kg)}</td>
+                    <td className="px-3 py-2 whitespace-nowrap text-right text-zinc-300 tabular-nums font-mono">
+                      {r.valor_proposto_ton != null ? r.valor_proposto_ton.toLocaleString('pt-BR', { minimumFractionDigits: 2 }) : '—'}
+                    </td>
+                    <td className="px-3 py-2 whitespace-nowrap text-zinc-400">{r.status || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </>
+  )
+}
+
 // ─── Page ──────────────────────────────────────────────────────────────────────
 
 export default function TorreDeControle() {
@@ -835,6 +1015,10 @@ export default function TorreDeControle() {
   const [radarOpen,       setRadarOpen]       = useState(false)
   const [timelineData,    setTimelineData]    = useState<TimelineMensagem[]>([])
   const [timelineLoading, setTimelineLoading] = useState(false)
+
+  const [ongoGeralOpen,    setOngoGeralOpen]    = useState(false)
+  const [ongoGeralRows,    setOngoGeralRows]    = useState<CargaOngoGeral[]>([])
+  const [ongoGeralLoading, setOngoGeralLoading] = useState(false)
 
   const [toastVisible, setToastVisible] = useState(false)
   const [toastMsg,     setToastMsg]     = useState('')
@@ -887,15 +1071,19 @@ export default function TorreDeControle() {
   useEffect(() => {
     const fetchTrizy = async () => {
       try {
-        const [resCount, resCot] = await Promise.all([
+        const [resCount, resCot, resOngo] = await Promise.all([
           fetch('/api/trizy/count',    { cache: 'no-store' }),
           fetch('/api/trizy/cotacoes', { cache: 'no-store' }),
+          fetch('/api/ongo-geral',     { cache: 'no-store' }),
         ])
         const dataCount = await resCount.json()
         const dataCot   = await resCot.json()
+        const dataOngo  = await resOngo.json()
         if (typeof dataCount.count === 'number') setTrizyCount(dataCount.count)
-        if (Array.isArray(dataCot.cotacoes))     setTrizyCotacoes(dataCot.cotacoes)
+        if (Array.isArray(dataCot.cotacoes))      setTrizyCotacoes(dataCot.cotacoes)
+        if (Array.isArray(dataOngo.cargas))       setOngoGeralRows(dataOngo.cargas)
       } catch { /* silencia */ }
+      finally { setOngoGeralLoading(false) }
     }
     fetchTrizy()
     const id = setInterval(fetchTrizy, 10000)
@@ -980,6 +1168,13 @@ export default function TorreDeControle() {
         loading={timelineLoading}
       />
 
+      <OngoGeralModal
+        open={ongoGeralOpen}
+        onClose={() => setOngoGeralOpen(false)}
+        rows={ongoGeralRows}
+        loading={ongoGeralLoading}
+      />
+
       <CotacaoDrawer
         item={drawerItem}
         onClose={() => setDrawerItem(null)}
@@ -1022,12 +1217,17 @@ export default function TorreDeControle() {
             <FonteCard
               key={fonte}
               fonte={fonte}
-              count={fonte === 'ongo_cotacao' ? trizyCount : countByFonte(fonte)}
+              count={
+                fonte === 'ongo_cotacao' ? trizyCount :
+                fonte === 'ongo_geral'   ? ongoGeralRows.length :
+                countByFonte(fonte)
+              }
               lastUpdate={lastUpdate}
               active={fonte === 'ongo_cotacao' && filtroFonte === 'ongo_cotacao'}
               onClick={
                 fonte === 'whatsapp_grupo' ? () => setRadarOpen(true) :
                 fonte === 'ongo_cotacao'   ? () => setFiltroFonte(f => f === 'ongo_cotacao' ? '' : 'ongo_cotacao') :
+                fonte === 'ongo_geral'     ? () => setOngoGeralOpen(true) :
                 undefined
               }
             />

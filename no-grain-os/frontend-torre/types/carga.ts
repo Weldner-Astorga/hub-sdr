@@ -76,6 +76,23 @@ export interface CargaLogistica {
   }
 }
 
+// M15 — Frete Geral Ongo (tabela cargas_ongo, sincronizada por extract_ongo.py)
+export interface CargaOngoGeral {
+  id: string
+  link_id_carga: string
+  data_captura: string
+  empresa: string
+  municipio_origem: string
+  terminal_origem: string
+  origem: string
+  destino: string
+  produto: string
+  quantidade_kg: number
+  saldo_restante_kg: number
+  valor_proposto_ton: number | null
+  status: string
+}
+
 export interface ApiResponse {
   fretes: CargaLogistica[]
   timestamp: string

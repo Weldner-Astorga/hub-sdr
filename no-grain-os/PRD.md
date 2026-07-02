@@ -1,7 +1,7 @@
 # NO GRAIN OS — Product Requirements Document (PRD)
 
-**Versão:** 3.0  
-**Data:** 2026-06-30  
+**Versão:** 3.1  
+**Data:** 2026-07-02  
 **Dono:** Weldner Astorga / Octamove  
 **Email:** edastorga0@gmail.com
 
@@ -52,8 +52,9 @@ painel_fretes              — cotações estruturadas (WhatsApp + Gmail)
 whatsapp_timeline          — feed completo de mensagens dos grupos (cotação + aviso)
 qualp_cache                — cache 24h de rotas QualP V4
 antt_coeficientes          — coeficientes CCD/CCF ANTT por tipo de veículo
-historico_fechamentos      — embeddings pgvector de cotações GANHA/RESPONDIDA (RAG)
+historico_fechamentos      — embeddings pgvector de fechamentos GANHA/RESPONDIDA + Ongo Geral (RAG)
 octamove_extracao_trizy    — BIDs do marketplace Trizy (extrator local no notebook)
+cargas_ongo                — lotes do Ongo Cargas (Frete Geral), sincronizados por extract_ongo.py
 ```
 
 ### Fluxo de Ingestão
@@ -69,8 +70,12 @@ Gmail (octamoveai@gmail.com)
     → APScheduler 1min → gmail_service.py
     → GPT-4o-mini → painel_fretes
 
-Ongo Cargas (planilha)
-    → Google Sheets readonly → GET /fretes (merge) → Torre
+Ongo Cargas (planilha) — LOCAL no notebook Windows
+    → Task Scheduler 23:55 (run_ongo_diario.bat) → extract_ongo.py
+    → Google Sheets (fonte original) + upsert cargas_ongo (Supabase)
+    → Torre lê via /api/ongo-geral (Next.js → Supabase direto) → dashboard "Frete Geral Ongo"
+    → fechamento_ongo_diario.py: Volume Liberado x Saldo Restante por rota/produto
+      → indexa em historico_fechamentos (mesmo RAG do precificador)
 
 Trizy BID (marketplace B2B) — LOCAL no notebook Windows
     → Task Scheduler → trizy_extractor.py v5
@@ -101,7 +106,8 @@ Torre → clica cotação → Workspace Calculadora
 - Cards KPI clicáveis com filtros (Total / Pendentes / Ganhas)
 - Tabela: Cliente, Rota, Produto/R$/t, Volume, Recebida/SLA, Status, Ações
 - Coluna "Recebida / SLA": horário exato + tempo relativo (verde/âmbar/vermelho)
-- Source cards: Ongo / Radar WhatsApp / Gmail / Frete Geral / **Trizy BID**
+- Source cards: Radar WhatsApp / Gmail / **Frete Geral Ongo** / **Trizy BID**
+- **Frete Geral Ongo (2026-07-02, M15):** card abre dashboard in-app (antes só linkava pro Google Sheets) — resumo real-time (Total de Lotes / Volume Liberado / Saldo Restante), filtros por Município/Terminal/Empresa recalculando os totais, grid completo + botão para ainda abrir a planilha original
 - Polling automático 5s
 - StatusDropdown com 8 transições
 - **Trizy BID (2026-06-30):**
@@ -117,6 +123,15 @@ Torre → clica cotação → Workspace Calculadora
 - Classificação automática: cotação (origem+destino identificados) vs aviso
 - Suporte a múltiplos grupos com nomes mapeados
 
+### Ingestão Gmail
+- Polling automático 1min (inbox + spam), extração via GPT-4o-mini
+- **Fix dedup (2026-07-02):** cotações vindas do Gmail paravam de ser gravadas silenciosamente
+  (erro `42P10` por `upsert` contra constraint inexistente no banco) e o e-mail era marcado como
+  processado mesmo assim — perda permanente. Corrigido: dedup em duas camadas (checa-antes-de-
+  inserir na aplicação + índice único parcial `painel_fretes_gmail_message_id_key` no banco,
+  aplicado via migration `fix_gmail_dedup.sql`); falha de gravação agora é retentada no próximo
+  ciclo em vez de descartada. 8 cotações perdidas recuperadas — ver M17.2/M17.3
+
 ### Calculadora de Rotas
 - Distância via QualP V4 (cache-aside 24h)
 - Pedágios por eixo (7E Bitrem / 9E Rodotrem)
@@ -124,6 +139,12 @@ Torre → clica cotação → Workspace Calculadora
 - Mapa Leaflet com polyline e marcadores de pedágio
 - Painel "Inteligência de Mercado" (RAG top-5 últimos 30 dias)
 - Ações: Salvar Preço, Copiar WhatsApp, Enviar Aprovação, Copiar Link
+- **Ponto Exato (2026-07-02):** badge `⚡ Usar Ponto Exato` injeta nome do local (Trizy) ou
+  coordenada GPS (Ongo/WhatsApp/Gmail) no payload do QualP em vez de só `Cidade/UF`, com
+  fallback automático + aviso caso o QualP não geocodifique o ponto. Deployado e validado
+  end-to-end na VPS (800+km → 278km na cotação Trizy 00067487). Integração com Google Geocoding
+  (pra fechar o gap restante até os ~348km do teto do QualP) foi avaliada, testada e **abortada**
+  por restrição de billing no Google Cloud Console do cliente — ver M17/M17.1
 
 ### Funil de Status (8 estágios)
 ```
@@ -187,6 +208,7 @@ python backend/deploy_vps.py
 | `backend/milestones/m5_whatsapp_timeline.sql` | ✅ | Tabela whatsapp_timeline |
 | `backend/precificador_migration.sql` | ✅ | antt_coeficientes, historico_fechamentos, RPC pgvector |
 | Inline | ✅ | `ALTER TABLE whatsapp_timeline ADD COLUMN grupo_nome text` |
+| `backend/ongo_geral_migration.sql` | ✅ | Tabela `cargas_ongo` (M15) |
 
 ---
 
@@ -200,7 +222,7 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | M13 | Pipeline "Aguardando Resposta" (convive c/ roteamento por margem) + export geolocalizado (maps links no template de cópia) | ✅ 2026-07-01 |
 | M14 | Hotfix preço Trizy + `@tremor/react` removido (dep morta) + RAG (typo SQL em produção) + saneamento endereço + mapa dark HD | ✅ 2026-07-02 |
 | — | **Hotfix crítico QualP** — `/router/v4` (404) → `/rotas/v4` (200) + reescrita completa do parsing (schema real é PT-BR) | ✅ 2026-07-02 |
-| M15 | Ongo: view planilha + métricas de Aderência % + fechamento diário RAG | Backlog |
+| M15 | Ongo: dashboard in-app (Total Lotes/Volume Liberado/Saldo Restante) + fechamento diário no RAG | ✅ 2026-07-02 |
 | M16 | Gmail anti-ruído + triagem WhatsApp + card Liberações + botão `[Tratado]` | Backlog |
 
 ## 9.1 Backlog Priorizado (legado)
@@ -210,9 +232,9 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | Alta | Trizy FASE 2: POST lance via calculadora (`/bid/.../lance`) |
 | Alta | Trizy: token auto-renovação via Task Scheduler diário |
 | Alta | Trizy: alerta WhatsApp para novos BIDs de interesse |
-| Alta | Ongo Task Scheduler automático às 23:55 |
 | Média | Trizy CRM N8N: workflow por `status_crm` |
-| Média | Ongo: aba Aderência Transportadoras no extrator |
+| Média | Ongo: aba Aderência Transportadoras (check-in/reagendamento/score) no extrator |
+| Média | Ongo: migrar Task Scheduler do notebook Windows para cron na VPS |
 | Média | Adicionar grupos reais de frete (APCAM, Fretes MT, etc.) |
 | Média | Popular `historico_fechamentos` com dados históricos |
 | Baixa | Notificações push / som na Torre ao receber cotação |
@@ -235,3 +257,5 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | QualP endpoint/auth errados (RESOLVIDO 2026-07-02) | URL era `/router/v4` (404) — correto é `/rotas/v4`; header era `Authorization: Bearer` (401) — correto é `access-token: TOKEN`. Schema de resposta também é 100% PT-BR (`distancia.valor`, `pedagios[].tarifa.<eixo>`, `polilinha_codificada` — polyline do Google, precisão 1e6, decodificar manualmente; `tabela_frete.dados.A.<eixos>`) | `services/qualp_service.py` reescrito: `_decode_polyline()` + extratores atualizados para o schema real |
 | RPC do Supabase diverge do `.sql` local no repo | Alguém editou a função direto no SQL Editor sem atualizar o arquivo versionado (aconteceu com `buscar_fretes_similares`: `data_limite`→`data_limi`) | Sem acesso Postgres direto nem `exec_sql` RPC — reaplicar o `CREATE OR REPLACE FUNCTION` do `.sql` local manualmente no SQL Editor quando suspeitar de divergência |
 | Login automatizado no Supabase Studio via Puppeteer | CAPTCHA anti-bot bloqueia (não contornar) | Pedir para o usuário rodar SQL manualmente, ou usar credenciais de API/DB direto quando disponíveis |
+| `syntax error at or near "CREATE"` ao rodar migration no SQL Editor | Caracteres decorativos não-ASCII nos comentários (`═`, `──`, acentos) corrompidos no copiar/colar do editor web | Escrever migrations em ASCII puro, sem acentos/box-drawing nos comentários |
+| Script Python derruba com `UnicodeEncodeError` (`→`, emojis) ao rodar no Windows | Console/pipe usa `cp1252` por padrão fora de um terminal UTF-8 real — afeta também `.bat` que redireciona output pra log (ex.: cron) | `sys.stdout/stderr.reconfigure(encoding="utf-8", errors="replace")` no topo do script |
