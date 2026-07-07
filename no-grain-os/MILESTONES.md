@@ -1,7 +1,7 @@
 # NO GRAIN OS — Milestones
 
-**Última atualização:** 2026-07-02  
-**Versão:** 3.1  
+**Última atualização:** 2026-07-06  
+**Versão:** 3.2  
 **Ambiente:** VPS `2.24.201.246` | Backend :8000 | Frontend :3000
 
 ---
@@ -309,11 +309,39 @@ O achado do M14 ("bloqueia TODA a calculadora") tinha duas causas empilhadas, n�
 
 **Pendente (backlog, não bloqueia M15):** Task Scheduler roda **local no Windows** do usuário, não na VPS — o fechamento das 23:55 depende do notebook estar ligado nesse horário. Breakdown por transportadora (check-in/reagendamento/score) do plano original não foi implementado — ver `project_ongo_script.md`.
 
-### M16 — Ingestão Avançada: Gmail Anti-Ruído + Triagem WhatsApp (Backlog)
-- Filtro classificador Gmail (RAG de triagem) — só Cotações de Frete e Liberações de Embarque
-- Card WhatsApp com volumetria tipificada: `Total X — Informações Y — Cotações Z`
-- Parser de "Embarque Liberado" (BTG/Ricelly) → card/campo "Liberações" estruturado
-- Botão `[Tratado]` no Radar WhatsApp — oculta da fila visual, mantém arquivado no banco
+### M16 — Ingestão Avançada: Gmail Anti-Ruído + Triagem WhatsApp ✅ (parcial)
+**Entregue:** 2026-07-06 — 3 dos 4 itens (Grupo 2 do punch-list pós-auditoria M19)
+
+**1. Anti-ruído Gmail:** achado que o "Fix Classificador — Determinismo" (2026-06-26) só tinha
+sido aplicado no WhatsApp (`webhook_evolution.py`) — `gmail_service.py` ainda gateava cotação por
+`nivel_confianca == "baixo"` (GPT-4o-mini não-determinístico nesse campo, armadilha já conhecida).
+Trocado pro mesmo critério robusto: `origem/destino != "Não Especificado"`. Mesma correção já
+provada, só replicada no lugar que faltava.
+
+**2. Card WhatsApp com volumetria tipificada:** `routers/whatsapp_timeline.py` ganhou
+`total_cotacao`/`total_aviso` (contagem exata via PostgREST `count=exact`); card "Radar WhatsApp"
+mostra `"{cotações} cotações · {avisos} avisos"` em vez de legenda genérica. Validado em produção:
+**6 cotações vs. 187 avisos** — confirma na prática o quanto o Radar era ruído puro sem essa
+visibilidade.
+- **Bug achado e corrigido de bônus:** o `select` do endpoint nunca buscava `grupo_nome`, mesmo a
+  coluna existindo desde o M5 e o frontend já ter o badge pronto — o badge nunca aparecia. Um
+  `SELECT` de uma palavra faltando.
+
+**3. Botão `[Tratado]`:** nova coluna `whatsapp_timeline.tratado` (migration
+`backend/whatsapp_tratado_migration.sql`); `GET /api/whatsapp/timeline` filtra `tratado=false` por
+padrão; `PATCH /api/whatsapp/timeline/{id}/tratado` marca sem deletar. Botão no
+`RadarWhatsAppTimeline` remove o item da lista local na hora (otimista).
+
+**Validado ao vivo (VPS):** card mostrando "6 cotações · 186 avisos" após marcar 1 item; badge de
+grupo aparecendo (`"COA - Central Agrícola"`); item marcado Tratado sumiu da gaveta e confirmado
+`tratado=true` persistido via Supabase REST.
+
+**Pendente (não incluído, falta amostra real):** parser de "Embarque Liberado" (BTG/Ricelly) — sem
+exemplo de mensagem real pra basear o parser, fica em backlog até termos um caso concreto.
+
+**Achado não corrigido (fora de escopo, notado ao ler os textos das mensagens):** mojibake visível
+nos textos do WhatsApp (`"jÃ¡ deu uma luz"` em vez de `"já deu uma luz"`) — sugere
+double-encoding em algum ponto da ingestão Evolution API. Não investigado nesta rodada.
 
 ### M17 — Precisão Geográfica: Ponto Exato no QualP ✅
 **Entregue:** 2026-07-02
@@ -487,10 +515,207 @@ Gmail validado de ponta a ponta.
 
 ---
 
+## FASE 5 — Auditoria de Fluxo de Cotação
+
+### M19 — Auditoria de Fluxo + Fix Preço Comercial Final (Drawer) ✅
+**Entregue:** 2026-07-06
+
+**Contexto:** sessão de auditoria testando a Torre como usuário real (cotação Cooperbem via
+e-mail) revelou vários gaps no fluxo de cotação. Um deles tinha causa raiz clara e correção
+imediata; os demais viraram achados documentados abaixo, para não se perderem.
+
+**Causa raiz do bug corrigido:** o campo "Preço Comercial Final (R$/t)" no rodapé do
+`CotacaoDrawer` (`frontend-torre/app/page.tsx`) só alimentava o texto do "Copiar Dados Brutos" —
+não existia botão de salvar dedicado, e os botões GANHA/PERDIDA (`handleFechar` →
+`fecharCotacao`) nunca enviavam esse valor a lugar nenhum. Era possível fechar uma cotação como
+GANHA sem o preço final comercial jamais ser persistido no banco.
+
+**Correção (frontend apenas, zero mudança de backend):**
+- Nova função `salvarPrecoFinal()` reaproveita `PATCH /cotacoes/{id}/preco`
+  (`backend/routers/cotacoes.py:188-231`) — o mesmo endpoint já usado pela calculadora
+  (`salvarPreco()` em `app/torre/calcular/[id]/page.tsx`), que já calcula margem vs. ANTT e já
+  tem fallback Trizy (`_update_trizy`, do M14). Nenhum endpoint novo foi necessário.
+- Botão **"Salvar"** ao lado do input do preço final, com estado de loading próprio
+  (`salvandoPrecoFinal`) e atualização otimista do status na tabela via `onUpdateStatus`.
+- `handleFechar(status)`: se houver valor digitado em "Preço Comercial Final", salva primeiro
+  (bloqueia o fechamento em caso de falha) antes de chamar GANHA/PERDIDA — não é mais possível
+  fechar uma cotação com um preço digitado e não confirmado.
+
+**Decisão de produto registrada — Fluxo Híbrido de Cotação:** decidido que o fluxo de cotação
+(recepção → radar/triagem → calculadora → precificação filial → auditoria/diretoria → resposta →
+status) será **assistido por IA, não automatizado de ponta a ponta**. A IA cuida do trabalho
+mecânico (extração de dados, geocoding, cálculo de rota/pedágio/ANTT, sugestão de preço via RAG,
+redação da resposta); o humano segue decidindo e confirmando os pontos de risco financeiro —
+preço final (este milestone corrige exatamente esse ponto) e envio da resposta ao cliente. Para
+lidar com a diversidade de formatos por cliente, a calibração será via **perfil few-shot por
+cliente** (poucos e-mails reais + extração correta, guardados por domínio/remetente e injetados
+no prompt), montado no onboarding do cliente antes de ele ir para produção plena — não fine-tuning
+do modelo (caro, lento, exige volume de dados que um cliente novo não tem). Ver PRD.md 9.3.
+
+**Achados da auditoria ainda não corrigidos (backlog, ver PRD.md 9.1):**
+- Prazo de resposta às vezes extraído errado mesmo com a regra 11 já existente no
+  `SYSTEM_PROMPT` (`openai_service.py`) — reforça a armadilha já conhecida do `nivel_confianca`
+  não-determinístico do GPT-4o-mini.
+- Radar WhatsApp sem triagem cotação-vs-ruído com fila de revisão separada por confiança —
+  relacionado ao M16 (Gmail Anti-Ruído + Triagem WhatsApp), hoje em backlog.
+- Histórico diário: falta decidir onde grava o fechamento das 23:59 (aba própria no Sheets com
+  seletor de data) e consistência do filtro de Status do Radar com o padrão de filtros dinâmicos
+  já usado no modal Ongo Geral (M15). Logo do Trizy no card — item cosmético, baixo esforço.
+
+**Validado:** `npx tsc --noEmit` e `npm run build` limpos em `frontend-torre`.
+
+**Fix adicional (mesmo dia) — Seção "Localização" no Drawer para Gmail/WhatsApp:** o Drawer só
+tinha localização detalhada para a fonte Trizy; para Gmail/WhatsApp, adicionada seção própria
+(painel esquerdo, entre SLA e o bloco Trizy) que usa `origem_maps_link`/`destino_maps_link` se
+existirem, ou monta o link a partir de `coords_coleta_lat/lng`/`coords_entrega_lat/lng` (mesmo
+padrão de `?q=lat,lng` que o `location_parser.py` já produz); quando não há nenhum dos dois, exibe
+"Localização de origem/destino não confirmada" em vez de esconder a seção — espelha o
+comportamento já existente na calculadora (link quando geocodificável, aviso quando não), sem
+alterar nada da calculadora em si. Testado ao vivo na VPS nos dois caminhos (sem coordenada real da
+cotação Cooperbem, e com coordenada injetada temporariamente para validar o link `Maps Origem` →
+restaurado ao estado original depois).
+
+**Fix adicional (mesmo dia) — mesma lógica de Localização também para Trizy:** o bloco "Links
+Google Maps" da seção Trizy do Drawer omitia silenciosamente o link quando
+`origem_maps_link`/`destino_maps_link` estavam ausentes (diferente do padrão recém-criado acima).
+Unificado: agora as **3 fontes de ingestão (WhatsApp, Gmail, Trizy/portais externos) usam a mesma
+regra** — link clicável quando existe, "Localização de coleta/descarga não confirmada" quando não.
+Testado ao vivo com um BID sem link (`#00066177`, mostra os dois avisos) e um BID com link
+(`#00066207`, mostra "Maps Coleta"/"Maps Descarga" clicáveis).
+
+**Fix adicional (mesmo dia) — Card Gmail sem clique:** causa raiz mais funda do que parecia —
+`FonteCard` (`app/page.tsx`) só embrulhava o card num `<button>` para três fontes hardcoded
+(`isOngo`/`isWhatsApp`/`isTrizy`); qualquer outra fonte, mesmo recebendo `onClick` via prop, caía
+num `<div>` sem clique nenhum — a variável `isClickable` já existia calculada mas não era usada
+na decisão de renderização. Generalizado o `if` final para `isClickable`, e adicionado o branch
+`gmail_cotacao` no `onClick`/`active` do grid de source cards (mesmo padrão de toggle de
+`filtroFonte` já usado pelo card Trizy). Testado ao vivo na VPS: clique no card "Cotações Email
+(Gmail)" agora filtra o Radar de Cotações para Gmail (24 registros, batendo com o contador do
+card).
+
+---
+
+## FASE 6 — Geocoding e Robustez de Localização
+
+### M20 — Geocoding real via Nominatim (Grupo 1 do punch-list pós-auditoria) ✅
+**Entregue:** 2026-07-06
+
+**Contexto:** o M17.1 tinha implementado geocoding de texto via Google Maps API, mas reverteu por
+restrição de billing no Google Cloud Console do cliente (não era erro de design). Retomado agora
+com **Nominatim (OpenStreetMap)** — API pública, gratuita, sem chave/billing.
+
+**O que foi criado:**
+- `backend/services/geocoding_service.py` — `geocode_endereco()`, cache-aside contra nova tabela
+  `geocoding_cache` (mesmo padrão de `qualp_cache`/`qualp_service.py`), fallback pro Nominatim
+  (`GET nominatim.openstreetmap.org/search`, `User-Agent` próprio, `countrycodes=br`) em cache miss.
+- `backend/services/location_parser.py`: `extrair_endereco_busca()` (novo — extrai texto de
+  `daddr=`, `/maps/search/`, `/maps/place/`) e `resolver_coords_com_geocoding()` (orquestra
+  `extrair_coords()` existente → `extrair_endereco_busca()` → `geocode_endereco()`). `extrair_coords()`
+  em si **não foi alterado** — é só o primeiro degrau da nova cadeia.
+- `gmail_service.py` e `webhook_evolution.py`: trocado `extrair_coords()` por
+  `await resolver_coords_com_geocoding()` na ingestão — grava `coords_coleta_lat/lng` mesmo quando
+  o link do Maps só tinha texto de endereço, não coordenada. Isso alimenta automaticamente o bloco
+  "Localização" do Drawer (M19) e o badge "Ponto Exato" da calculadora (M17), sem mudar nenhum dos
+  dois.
+- `routers/precificar.py::_resolver_ponto_exato()`: virou `async`, ganhou mais um degrau antes do
+  fallback pro texto cru — geocodifica via `geocode_endereco()` quando só há texto do ponto exato
+  (Trizy/manual), antes de mandar pro QualP (que só acerta cidade/UF em endereço rural específico).
+- `backend/geocoding_cache_migration.sql` — aplicada em produção pelo usuário via SQL Editor.
+
+**Validado (VPS, produção real):**
+- `extrair_endereco_busca()` contra a URL real da cotação Cooperbem → extraiu
+  `"Campo Verde, MT, 78840-000"` corretamente.
+- `resolver_coords_com_geocoding()` → Nominatim resolveu `(-15.5430787, -55.1590511)` (coordenada
+  real de Campo Verde/MT); segunda chamada confirmada como cache HIT (linha persistida em
+  `geocoding_cache`, verificado via Supabase REST).
+- `POST /api/precificar/` com `destino_ponto_exato` sem coordenada (`"Rumo, Rondonopolis/MT"`) →
+  HTTP 200, geocoding resolveu, QualP calculou 92km, sem `aviso` de fallback.
+
+**Backlog restante desta linha:** nenhum — Grupo 1 do punch-list concluído. Próximo: Grupo 2
+(M16 — triagem do Radar por confiança).
+
+---
+
+### M21 — Logo Trizy, Filtro de Status Dinâmico, Histórico com Data na Torre (Grupos 3+4) ✅
+**Entregue:** 2026-07-06
+
+**1. Logo Trizy:** usuário enviou o arquivo (`public/trizy-logo.png`); `FonteCard` renderiza a
+imagem no lugar do ícone genérico `Truck` especificamente para `ongo_cotacao`.
+
+**2. Filtro de Status — fix de completude:** o `<select>` de Status do Radar tinha só 6 das 9
+opções possíveis (faltavam `RECEBIDA`, `CALCULADA`, `COTADO_AGUARDANDO` — hardcoded à mão e nunca
+atualizado). Trocado por `[...STATUS_OPCOES, 'COTADO_AGUARDANDO'].map(...)` usando os labels de
+`STATUS_CONFIG` — única fonte de verdade, sem duplicar a lista.
+
+**3. Histórico com seletor de data dentro da Torre:** não existe tabela Supabase com snapshot
+diário do Ongo — só a aba "Histórico" do Sheets (append-only, escrita por
+`extract_ongo.py::_compute_historico_rows()`). Criado:
+- `services/sheets_reader.py::listar_historico(data_filtro)` — lê `Histórico!A:M`, filtra por
+  "Data Captura" (`DD/MM/YYYY`), mesmo padrão de `_get_service()`/parsing já usado pra aba
+  "Carregamentos".
+- `routers/ongo_historico.py` — `GET /api/ongo-geral/historico?data=DD/MM/YYYY` (default hoje),
+  registrado em `main.py`.
+- Proxy `app/api/ongo-geral/historico/route.ts` + `OngoGeralModal` ganhou abas "Ao Vivo"/"Histórico"
+  — Histórico tem `<input type="date">` + tabela com as 13 colunas originais da aba.
+
+**Validado ao vivo (VPS):** `curl /api/ongo-geral/historico?data=03/07/2026` retornou linhas reais
+(o único ciclo bem-sucedido antes do crash do Playwright investigado antes); testado no navegador
+— aba Histórico com a mesma data populando a tabela corretamente; card Trizy mostrando a logo real;
+dropdown de Status confirmado com as 9 opções.
+
+**Achado não corrigido (fora de escopo, notado nos dados da aba Histórico):** o campo "Rota" tem o
+mesmo tipo de mojibake já visto no WhatsApp (`"â†'"` em vez de `"→"`) quando inspecionado via
+`curl`/terminal — no navegador renderiza certo, então é mais provável ser um artefato de exibição
+do terminal Windows do que corrupção real do dado; não investigado a fundo.
+
+**Backlog restante do punch-list pós-auditoria:** nenhum — Grupo 5 concluído a seguir (M22).
+
+---
+
+### M22 — Retry de Login + Alerta WhatsApp no Cron do Ongo (Grupo 5) ✅
+**Entregue:** 2026-07-06
+
+**Contexto:** causa raiz já investigada nesta mesma sessão (ver M21/histórico da conversa) —
+`extract_ongo.py::_login()` pode ter o Chromium crashando durante o login
+(`Navigation failed because page crashed!`), sem retry, derrubando o script inteiro em
+`run_ongo_once.py` silenciosamente. Migrar pra VPS foi descartado (risco de bloqueio anti-bot no
+IP de datacenter, decisão já registrada) — mitigação local: retry + alerta.
+
+**O que foi criado (100% local, nada na VPS):**
+- Novo `C:\Users\Dell\whatsapp_alert.py` — `alertar_falha(origem, detalhe)`, best-effort (nunca
+  propaga exceção), via Evolution API (`POST /message/sendText/octamove`).
+- `.env` raiz ganhou `EVOLUTION_URL`/`EVOLUTION_KEY`/`EVOLUTION_INSTANCIA`/`ALERTA_WHATSAPP_DESTINO`
+  — destino é o grupo **"Teste fretes"** (`120363410106462149@g.us`, já autorizado em
+  `webhook_evolution.py`), resolvido a partir de um link de convite via
+  `GET /group/inviteInfo/octamove?inviteCode=...` (consulta, sem entrar no grupo).
+- `run_ongo_once.py`: login agora tenta até 3x, **cada tentativa com browser e página novos**
+  (uma página crashada não pode ser reaproveitada); todo o script roda dentro de um `try/except`
+  que aciona `alertar_falha` em qualquer falha (não só login) antes de relançar.
+- `fechamento_ongo_diario.py`: os 2 early-returns por env var ausente e o bloco `__main__` também
+  acionam `alertar_falha`.
+
+**Validado ao vivo, com chamadas reais (nada mockado):**
+- Payload da Evolution API confirmado testando contra o número pessoal do usuário antes de decidir
+  o destino final.
+- Ciclo completo real (`run_ongo_once.py` + `fechamento_ongo_diario.py`) rodado do zero após a
+  mudança — login OK de primeira, 133 cargas/33 novas, 150 rotas indexadas no RAG — confirma que o
+  caminho feliz não regrediu.
+- Falha simulada (script de teste isolado no scratchpad, `m._login` forçado a sempre lançar
+  exceção): confirmadas as 3 tentativas reais com browser novo a cada uma, e o alerta disparado e
+  **recebido de fato** no grupo "Teste fretes".
+
+---
+
 ## PRÓXIMOS MILESTONES (Backlog)
 
 | # | Milestone | Descrição | Prioridade |
 |---|-----------|-----------|------------|
+| M18.1 | Ongo — Alerta "Sem Localização" | Ler o indicador nativo do Dashboard (motorista "Em Rota" sem ping GPS) e disparar WhatsApp via Evolution API quando ultrapassar X horas. Ver PRD 9.2 | Alta |
+| M18.2 | Ongo — Extrator "Fretes Cancelados" + "Troca de Nota" | Novas abas não cobertas hoje: cruzar cancelamento de frete (~18%/semana) com cancelamento de troca de CT-e (~35%/semana) num diagnóstico único pra abertura comercial. Ver PRD 9.2 | Alta |
+| M18.3 | Ongo — Score de Compliance de Descarga | Capturar campo "Desligou a câmera" + score de completude (X/4) da aba Descarregamentos, agregando por motorista/transportadora. Ver PRD 9.2 | Média |
+| M18.4 | Ongo — Score de Confiabilidade por CPF de motorista | Cruzar cadastro de Autônomos (405 motoristas, CPF) com histórico de cancelamento/reagendamento — hoje o score só existe agregado por transportadora. Ver PRD 9.2 | Média |
+| M18.5 | Ongo — Disparo automático pro motorista parado | Usar dados de "Aguardando Descarregamento" (nome/CPF/celular/placa) pra automação de WhatsApp cobrando status, sem ligação manual do comercial. Ver PRD 9.2 | Média |
+| M18.6 | Ongo — Auditar `LANCES_URL` morta no extrator | `/lances` não existe/não é acessível pra conta transportadora atual (redireciona pro Dashboard) — confirmar se é código morto antes de continuar confiando nela. Ver PRD 9.2 | Baixa |
 | M10 | Trizy FASE 2 — POST Lance | Botão "Fazer Oferta" na calculadora: `POST /bid/transportadora/cotacao-frete/{negociacaoId}/lance` | Alta |
 | M10 | Trizy — Token auto-renovação Task Scheduler | Agendar `trizy_login.py` diário para manter sessão ativa | Alta |
 | M10 | Trizy — Alerta WhatsApp | Enviar mensagem via Evolution API quando novo BID chega com produto/rota de interesse | Alta |

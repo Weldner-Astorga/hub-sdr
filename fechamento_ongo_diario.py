@@ -18,6 +18,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from whatsapp_alert import alertar_falha
+
 ENV_FILE = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=ENV_FILE)
 
@@ -65,9 +67,11 @@ def _agrupar_por_rota_produto(rows: list) -> dict:
 def main() -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         print(f"[ERRO {_ts()}] SUPABASE_URL/SUPABASE_SERVICE_KEY ausentes no .env.")
+        alertar_falha("Ongo - fechamento diario", "SUPABASE_URL/SUPABASE_SERVICE_KEY ausentes no .env.")
         return
     if not OPENAI_API_KEY:
         print(f"[ERRO {_ts()}] OPENAI_API_KEY ausente no .env.")
+        alertar_falha("Ongo - fechamento diario", "OPENAI_API_KEY ausente no .env.")
         return
 
     from supabase import create_client
@@ -136,4 +140,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        alertar_falha("Ongo - fechamento_ongo_diario.py", str(exc))
+        raise

@@ -1,7 +1,7 @@
 # NO GRAIN OS — Product Requirements Document (PRD)
 
-**Versão:** 3.1  
-**Data:** 2026-07-02  
+**Versão:** 3.2  
+**Data:** 2026-07-06  
 **Dono:** Weldner Astorga / Octamove  
 **Email:** edastorga0@gmail.com
 
@@ -223,7 +223,11 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | M14 | Hotfix preço Trizy + `@tremor/react` removido (dep morta) + RAG (typo SQL em produção) + saneamento endereço + mapa dark HD | ✅ 2026-07-02 |
 | — | **Hotfix crítico QualP** — `/router/v4` (404) → `/rotas/v4` (200) + reescrita completa do parsing (schema real é PT-BR) | ✅ 2026-07-02 |
 | M15 | Ongo: dashboard in-app (Total Lotes/Volume Liberado/Saldo Restante) + fechamento diário no RAG | ✅ 2026-07-02 |
-| M16 | Gmail anti-ruído + triagem WhatsApp + card Liberações + botão `[Tratado]` | Backlog |
+| M16 | Gmail anti-ruído + card WhatsApp com volumetria + botão `[Tratado]` | ✅ 2026-07-06 (parcial — card Liberações/parser Embarque Liberado seguem em backlog) |
+| M19 | Auditoria de fluxo (cotação Cooperbem) + fix Preço Comercial Final não persistido no Drawer + decisão de Fluxo Híbrido (ver 9.3) | ✅ 2026-07-06 |
+| M20 | Geocoding real via Nominatim (fallback quando link do Maps só tem texto de endereço) — ingestão + calculadora | ✅ 2026-07-06 |
+| M21 | Logo Trizy no card + filtro de Status dinâmico (fix completude) + Histórico do Ongo com seletor de data dentro da Torre | ✅ 2026-07-06 |
+| M22 | Retry de login (3x, browser novo) + alerta WhatsApp real (grupo Teste fretes) quando o cron local do Ongo falhar | ✅ 2026-07-06 |
 
 ## 9.1 Backlog Priorizado (legado)
 
@@ -234,12 +238,77 @@ Ver `MILESTONES.md` FASE 4 para detalhe técnico completo (M12–M16).
 | Alta | Trizy: alerta WhatsApp para novos BIDs de interesse |
 | Média | Trizy CRM N8N: workflow por `status_crm` |
 | Média | Ongo: aba Aderência Transportadoras (check-in/reagendamento/score) no extrator |
-| Média | Ongo: migrar Task Scheduler do notebook Windows para cron na VPS |
+| Adiada | Ongo: migrar Task Scheduler do notebook Windows para cron na VPS — decisão 2026-07-06: **não migrar agora**, risco de bloqueio anti-bot no IP de datacenter (perderia a ferramenta de extração). Mitigar localmente (retry/alerta) em vez de trocar de ambiente |
 | Média | Adicionar grupos reais de frete (APCAM, Fretes MT, etc.) |
 | Média | Popular `historico_fechamentos` com dados históricos |
 | Baixa | Notificações push / som na Torre ao receber cotação |
 | Baixa | CRM por embarcador (taxa de ganho, ticket médio) |
 | Baixa | App mobile PWA |
+| Média | Perfil few-shot por cliente para calibração da extração no onboarding (ver 9.3) |
+| Média | Parser de "Embarque Liberado" (BTG/Ricelly) — card Liberações estruturado (ver M16); falta amostra real de mensagem pra construir |
+| Baixa | Investigar mojibake nos textos do WhatsApp (`whatsapp_timeline`) e da aba Histórico do Ongo (campo Rota) — sugere double-encoding na ingestão (Evolution API e/ou `extract_ongo.py` local) |
+
+---
+
+## 9.2 Achados — Varredura Clínica do Portal Ongo (2026-07-04)
+
+Exploração manual (Puppeteer, login como transportadora `Nova Frota Transportes`, mesma conta usada pelo `extract_ongo.py`) de todas as abas do painel `painel.ongocargas.com.br`, com o objetivo de identificar dados nativos do portal que hoje **não são extraídos** e que podem virar inteligência vendável para as transportadoras. Hoje o extrator só cobre `/carregamentos` e `/agendamentos` (ver seção 4).
+
+| Onde (aba do portal) | O que identificamos | Possível implementação | Ganho pro produto | Ganho pro usuário (transportadora) |
+|---|---|---|---|---|
+| Dashboard de Cargas → widget "Sem Localização" | 11 motoristas marcados "Em Rota" sem nenhum ping de GPS no momento da checagem — hoje é só um número estático na tela, ninguém é avisado | Job de polling lendo esse indicador + alerta automático via WhatsApp (Evolution API) quando motorista fica X horas sem localização | Diferencial "alerta proativo de risco operacional" — nenhum concorrente mostra isso | Reduz risco de carga extraviada/atraso não percebido; evita perda de SLA com o embarcador sem precisar checar o portal manualmente |
+| Troca de Nota (aba inteira não coberta) | Métricas nativas de status: 34 Concluído / **26 Cancelado** / 15 Aguardando Transportadora — ~35% de cancelamento de troca de CT-e na semana amostrada | Extrator novo lendo essa aba, upsert em tabela `ongo_troca_nota`, card "% Troca de Nota Cancelada" na Torre | Métrica exclusiva de eficiência fiscal/burocrática, hoje invisível pro cliente | Visibilidade de gargalo de faturamento — menos CT-e parado, cobrança mais rápida |
+| Descarregamentos (aba inteira não coberta) | Campo **"Desligou a câmera" (Sim/Não)** + score de completude por descarga (ex.: "4/4", "3/4", "2/4") com foto do canhoto | Capturar os campos e compor um "Score de Compliance" agregado por motorista/transportadora/período | Relatório de compliance vendável separadamente ao embarcador (Alvorada) como "auditoria terceirizada" | Identifica motoristas/rotas de risco antes que virem problema contratual ou multa |
+| Autônomos → Motoristas | Cadastro completo com 405 motoristas (Nome, CPF, Proprietário) hoje isolado do restante da análise | Cruzar CPF do motorista com histórico de cancelamento/reagendamento para pontuar risco por indivíduo, não só por transportadora agregada | Aprofunda o "Score de Confiabilidade" (backlog M15) até o nível de motorista | Transportadora sabe exatamente qual motorista está gerando o problema, não só "a frota" de forma vaga |
+| Relatórios → Administrativos → Fretes Cancelados (não coberto) | 49 cancelamentos vs. 270 fretes realizados na mesma semana (~18%), já com motorista/origem/destino nominal | Extrator dedicado + card "Taxa de Cancelamento" na Torre, cruzado com Troca de Nota para visão consolidada | Vira o diagnóstico pronto de abertura de reunião comercial — números reais, não estimados | Entende exatamente onde está perdendo frete/dinheiro, rota por rota |
+| Relatórios → Administrativos → Aguardando Descarregamento (não coberto) | 83 registros com nome, CPF, **celular** do motorista, placa e "Ticket em análise" (Sim/Não) | Automação de disparo de WhatsApp direto pro motorista parado pedindo status/atualização, sem ligação manual do comercial | Fecha o loop de "substituição de trabalho humano" — de ligação manual para mensagem automática | Reduz tempo de descarga parado, motorista sai mais rápido, gira mais frete/dia |
+| Rota `/lances` (constante `LANCES_URL` em `extract_ongo.py`) | Não existe/não acessível para esta conta — redireciona pro Dashboard | Validar se é código morto (remover) ou se depende de outro tipo de conta/permissão antes de continuar confiando nela em produção | Evita manter lógica morta / bug latente no extrator | — (item de higiene técnica) |
+
+**Priorização recomendada (impacto x esforço):** alerta "Sem Localização" e cruzamento Fretes Cancelados + Troca de Nota primeiro (mais baratos, mais fortes pra demo comercial); Score de Compliance de Descarga e granularidade por CPF de motorista em seguida; automação de WhatsApp pro motorista parado depois de validar volume real.
+
+---
+
+## 9.3 Fluxo Híbrido de Cotação (decisão 2026-07-06)
+
+Decisão de produto tomada após auditoria de fluxo (cotação real Cooperbem via e-mail, ver M19 em
+`MILESTONES.md`): o fluxo de cotação **não será automatizado de ponta a ponta**. Desenho aprovado:
+
+```
+1. Recebe (Email / WhatsApp / Portais)
+        ↓
+2. Radar — IA classifica: [Cotação] vs [Ruído]
+        ↓ (cotação)
+   confiança ALTA + cliente calibrado → vira card direto
+   confiança BAIXA/MÉDIA ou cliente não calibrado → fila "Revisar" (humano corrige antes de seguir)
+        ↓
+3. Calculadora (km/pedágio/ANTT) — com fallback de geocoding textual quando o link não tem lat/lng
+        ↓
+4. Encaminha p/ filial precificar (SLA visível)
+        ↓
+5. Auditoria unifica + diretoria valida
+        ↓
+6. Responde no canal de origem — IA redige, humano confirma e clica enviar (nenhum canal dispara sozinho)
+        ↓
+7. Status → Aguardando Resposta
+```
+
+**Princípio:** IA cuida do trabalho mecânico (extração, geocoding, cálculo, sugestão/redação);
+humano confirma sempre os dois pontos de risco financeiro/reputacional — preço final e envio da
+resposta ao cliente. Fast-track de envio automático para clientes de alta confiança fica para uma
+fase futura, não faz parte deste desenho inicial.
+
+**Calibração por cliente (onboarding):** em vez de fine-tuning do modelo (caro, lento, exige
+volume de dados que um cliente novo não tem), a calibração é via **perfil few-shot por cliente**:
+ao fechar a implementação, reunir alguns e-mails/mensagens reais do cliente, validar a extração
+contra eles, e guardar os exemplos corrigidos vinculados ao domínio do remetente (reaproveitando
+`services/domain_map.py::resolver_gmail`, já usado para identificar o cliente). Esses exemplos
+são injetados no prompt do GPT-4o-mini quando a mensagem vier daquele domínio. Enquanto um cliente
+não passar por esse gate, toda cotação dele entra na fila de revisão do passo 2, mesmo com
+confiança alta reportada pela IA — confiança alta e errada é o cenário mais perigoso.
+
+**Status:** decisão de arquitetura aprovada; implementação das peças (fila de revisão do Radar,
+perfil few-shot por cliente) ainda não iniciada — ver itens correspondentes na tabela de backlog
+(9.1).
 
 ---
 

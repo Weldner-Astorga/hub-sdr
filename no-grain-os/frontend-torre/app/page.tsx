@@ -234,8 +234,8 @@ function StatusDropdown({
   )
 }
 
-function FonteCard({ fonte, count, lastUpdate, onClick, active }: {
-  fonte: FonteIngestao; count: number; lastUpdate: string | null; onClick?: () => void; active?: boolean
+function FonteCard({ fonte, count, lastUpdate, onClick, active, legenda }: {
+  fonte: FonteIngestao; count: number; lastUpdate: string | null; onClick?: () => void; active?: boolean; legenda?: string
 }) {
   const cfg          = FONTE_CONFIG[fonte]
   const isOngo       = fonte === 'ongo_geral'
@@ -252,7 +252,9 @@ function FonteCard({ fonte, count, lastUpdate, onClick, active }: {
     }`}>
       <div className={`absolute inset-0 bg-gradient-to-br ${cfg.glowCls} pointer-events-none`} />
       <div className="relative flex items-center justify-between">
-        <div className={`p-2 rounded-lg bg-zinc-800 ${cfg.iconCls}`}><cfg.Icon size={16} /></div>
+        <div className={`p-2 rounded-lg bg-zinc-800 ${cfg.iconCls} flex items-center justify-center`}>
+          {isTrizy ? <img src="/trizy-logo.png" alt="Trizy" className="h-4 w-auto" /> : <cfg.Icon size={16} />}
+        </div>
         <div className="flex items-center gap-2">
           {isOngo     && <Eye size={11} className="text-violet-400/60" />}
           {isWhatsApp && <Bell size={11} className="text-emerald-400/60" />}
@@ -266,7 +268,7 @@ function FonteCard({ fonte, count, lastUpdate, onClick, active }: {
         <p className="text-[11px] text-zinc-500 mb-0.5 font-medium uppercase tracking-wide">{cfg.cardLabel}</p>
         <p className="text-3xl font-bold text-white tabular-nums">{count}</p>
         <p className="text-[11px] text-zinc-600 mt-0.5">
-          {isWhatsApp ? 'clique para ver avisos de mercado' : 'registros capturados'}
+          {legenda ?? (isWhatsApp ? 'clique para ver avisos de mercado' : 'registros capturados')}
         </p>
       </div>
       <div className="relative border-t border-zinc-800 pt-2.5">
@@ -274,9 +276,7 @@ function FonteCard({ fonte, count, lastUpdate, onClick, active }: {
       </div>
     </div>
   )
-  if (isOngo)     return <button type="button" onClick={onClick} className="block text-left w-full">{inner}</button>
-  if (isWhatsApp) return <button type="button" onClick={onClick} className="block text-left w-full">{inner}</button>
-  if (isTrizy)    return <button type="button" onClick={onClick} className="block text-left w-full">{inner}</button>
+  if (isClickable) return <button type="button" onClick={onClick} className="block text-left w-full">{inner}</button>
   return inner
 }
 
@@ -302,6 +302,7 @@ function CotacaoDrawer({
   const [copied,      setCopied]      = useState(false)
   const [modoEdicao,  setModoEdicao]  = useState(false)
   const [salvandoDados, setSalvandoDados] = useState(false)
+  const [salvandoPrecoFinal, setSalvandoPrecoFinal] = useState(false)
   const [editCampos,  setEditCampos]  = useState({
     origem: '', destino: '', produto: '', embarcador: '', observacoes: '',
   })
@@ -333,6 +334,33 @@ function CotacaoDrawer({
       else showToast('Erro ao salvar.')
     } catch { showToast('Erro de rede.') }
     finally { setSalvandoDados(false) }
+  }
+
+  async function salvarPrecoFinal(): Promise<boolean> {
+    if (!item) return false
+    const preco = parseFloat(precoFinal)
+    if (!preco || preco <= 0) { showToast('Informe um preço válido.'); return false }
+    setSalvandoPrecoFinal(true)
+    try {
+      const res = await fetch(`/api/cotacoes/${item.id}/preco`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          preco_proposto:    preco,
+          antt_piso_por_ton: item.antt_piso_por_ton ?? 0,
+        }),
+      })
+      if (!res.ok) { showToast('Erro ao salvar preço.'); return false }
+      const data = await res.json()
+      showToast('Preço comercial final salvo!')
+      if (data.status) onUpdateStatus(item.id, data.status)
+      return true
+    } catch {
+      showToast('Erro de rede ao salvar preço.')
+      return false
+    } finally {
+      setSalvandoPrecoFinal(false)
+    }
   }
 
   function buildDadosBrutos(c: CargaLogistica): string {
@@ -381,6 +409,10 @@ function CotacaoDrawer({
 
   async function handleFechar(status: 'GANHA' | 'PERDIDA') {
     if (!item) return
+    if (precoFinal.trim()) {
+      const ok = await salvarPrecoFinal()
+      if (!ok) return
+    }
     await onFechar(item.id, status)
     onClose()
   }
@@ -540,6 +572,46 @@ function CotacaoDrawer({
                       {item.id_ongo && (
                         <p className="text-[9px] text-zinc-700 font-mono mt-1.5">ID Ongo: {item.id_ongo}</p>
                       )}
+
+                      {/* Localização — Gmail/WhatsApp (Trizy tem sua própria seção completa abaixo) */}
+                      {item.fonte_ingestao !== 'ongo_cotacao' && (() => {
+                        const origemLink = item.origem_maps_link
+                          || (item.coords_coleta_lat != null && item.coords_coleta_lng != null
+                                ? `https://www.google.com/maps?q=${item.coords_coleta_lat},${item.coords_coleta_lng}` : null)
+                        const destinoLink = item.destino_maps_link
+                          || (item.coords_entrega_lat != null && item.coords_entrega_lng != null
+                                ? `https://www.google.com/maps?q=${item.coords_entrega_lat},${item.coords_entrega_lng}` : null)
+                        return (
+                          <div className="mt-3 border-t border-zinc-800 pt-2.5">
+                            <p className="text-[9px] text-zinc-700 uppercase tracking-wide font-semibold mb-1.5 flex items-center gap-1">
+                              <MapPin size={9} /> Localização
+                            </p>
+                            <div className="flex flex-col gap-1.5">
+                              {origemLink ? (
+                                <a href={origemLink} target="_blank" rel="noopener noreferrer"
+                                  className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 bg-blue-500/10 border border-blue-500/25 px-2 py-1 rounded-md transition-colors w-fit">
+                                  <MapPin size={9} /> Maps Origem
+                                </a>
+                              ) : (
+                                <p className="text-[10px] text-zinc-600 flex items-center gap-1">
+                                  <AlertTriangle size={9} className="text-amber-500/70 shrink-0" /> Localização de origem não confirmada
+                                </p>
+                              )}
+                              {destinoLink ? (
+                                <a href={destinoLink} target="_blank" rel="noopener noreferrer"
+                                  className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 bg-blue-500/10 border border-blue-500/25 px-2 py-1 rounded-md transition-colors w-fit">
+                                  <MapPin size={9} /> Maps Destino
+                                </a>
+                              ) : (
+                                <p className="text-[10px] text-zinc-600 flex items-center gap-1">
+                                  <AlertTriangle size={9} className="text-amber-500/70 shrink-0" /> Localização de destino não confirmada
+                                </p>
+                              )}
+                            </div>
+                          </div>
+                        )
+                      })()}
+
                       {item.fonte_ingestao === 'ongo_cotacao' && (
                         <div className="mt-3 border-t border-zinc-800 pt-2.5">
                           <p className="text-[9px] text-orange-400/70 uppercase tracking-wide font-semibold mb-1.5 flex items-center gap-1">
@@ -587,19 +659,27 @@ function CotacaoDrawer({
                             </div>
                           ))}
 
-                          {/* Links Google Maps */}
-                          <div className="mt-2 flex gap-2 flex-wrap">
-                            {item.origem_maps_link && (
+                          {/* Links Google Maps — mesma lógica das outras fontes: link se existir, aviso se não */}
+                          <div className="mt-2 flex flex-col gap-1.5">
+                            {item.origem_maps_link ? (
                               <a href={item.origem_maps_link} target="_blank" rel="noopener noreferrer"
-                                className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 bg-blue-500/10 border border-blue-500/25 px-2 py-1 rounded-md transition-colors">
+                                className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 bg-blue-500/10 border border-blue-500/25 px-2 py-1 rounded-md transition-colors w-fit">
                                 <MapPin size={9} /> Maps Coleta
                               </a>
+                            ) : (
+                              <p className="text-[10px] text-zinc-600 flex items-center gap-1">
+                                <AlertTriangle size={9} className="text-amber-500/70 shrink-0" /> Localização de coleta não confirmada
+                              </p>
                             )}
-                            {item.destino_maps_link && (
+                            {item.destino_maps_link ? (
                               <a href={item.destino_maps_link} target="_blank" rel="noopener noreferrer"
-                                className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 bg-blue-500/10 border border-blue-500/25 px-2 py-1 rounded-md transition-colors">
+                                className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 bg-blue-500/10 border border-blue-500/25 px-2 py-1 rounded-md transition-colors w-fit">
                                 <MapPin size={9} /> Maps Descarga
                               </a>
+                            ) : (
+                              <p className="text-[10px] text-zinc-600 flex items-center gap-1">
+                                <AlertTriangle size={9} className="text-amber-500/70 shrink-0" /> Localização de descarga não confirmada
+                              </p>
                             )}
                           </div>
 
@@ -701,11 +781,21 @@ function CotacaoDrawer({
                 <label className="text-[10px] text-zinc-600 uppercase tracking-wide font-medium block mb-1.5">
                   Preço Comercial Final (R$/t)
                 </label>
-                <input
-                  type="number" value={precoFinal} onChange={e => setPrecoFinal(e.target.value)}
-                  placeholder="0,00" min="0" step="0.01"
-                  className="w-full bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded-lg px-3 py-2.5 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700 tabular-nums font-mono"
-                />
+                <div className="flex gap-2">
+                  <input
+                    type="number" value={precoFinal} onChange={e => setPrecoFinal(e.target.value)}
+                    placeholder="0,00" min="0" step="0.01"
+                    className="flex-1 bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded-lg px-3 py-2.5 focus:outline-none focus:border-emerald-500/60 placeholder-zinc-700 tabular-nums font-mono"
+                  />
+                  <button
+                    onClick={salvarPrecoFinal}
+                    disabled={salvandoPrecoFinal || !precoFinal.trim()}
+                    className="shrink-0 flex items-center gap-1.5 px-3.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 disabled:opacity-40 text-zinc-200 text-xs font-semibold border border-zinc-700 transition-colors"
+                  >
+                    {salvandoPrecoFinal ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+                    Salvar
+                  </button>
+                </div>
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -742,10 +832,11 @@ function formatDateTime(iso: string): string {
 }
 
 function RadarWhatsAppTimeline({
-  open, onClose, mensagens, loading,
+  open, onClose, mensagens, loading, onTratado,
 }: {
   open: boolean; onClose: () => void
   mensagens: TimelineMensagem[]; loading: boolean
+  onTratado: (id: string) => void
 }) {
   return (
     <>
@@ -802,6 +893,12 @@ function RadarWhatsAppTimeline({
                     )}
                   </div>
                   <p className="text-xs text-zinc-300 leading-relaxed whitespace-pre-wrap">{m.texto}</p>
+                  <button
+                    onClick={() => onTratado(m.id)}
+                    className="mt-1.5 flex items-center gap-1 text-[9px] text-zinc-500 hover:text-emerald-400 font-medium transition-colors"
+                  >
+                    <Check size={9} /> Tratado
+                  </button>
                 </div>
               </div>
             ))
@@ -827,6 +924,24 @@ function OngoGeralModal({
   const [filtroMunicipio, setFiltroMunicipio] = useState('')
   const [filtroTerminal,  setFiltroTerminal]  = useState('')
   const [filtroEmpresa,   setFiltroEmpresa]   = useState('')
+
+  const [aba, setAba] = useState<'aovivo' | 'historico'>('aovivo')
+  const hoje = new Date().toISOString().slice(0, 10)
+  const [dataHistorico,    setDataHistorico]    = useState(hoje)
+  const [historicoRows,    setHistoricoRows]    = useState<Record<string, string>[]>([])
+  const [historicoLoading, setHistoricoLoading] = useState(false)
+
+  useEffect(() => {
+    if (aba !== 'historico' || !open) return
+    const [ano, mes, dia] = dataHistorico.split('-')
+    const dataBr = `${dia}/${mes}/${ano}`
+    setHistoricoLoading(true)
+    fetch(`/api/ongo-geral/historico?data=${dataBr}`, { cache: 'no-store' })
+      .then(res => res.json())
+      .then(data => setHistoricoRows(Array.isArray(data.rows) ? data.rows : []))
+      .catch(() => setHistoricoRows([]))
+      .finally(() => setHistoricoLoading(false))
+  }, [aba, dataHistorico, open])
 
   const municipios = useMemo(() => Array.from(new Set(rows.map(r => r.municipio_origem).filter(Boolean))).sort(), [rows])
   const terminais  = useMemo(() => Array.from(new Set(rows.map(r => r.terminal_origem).filter(Boolean))).sort(), [rows])
@@ -879,9 +994,69 @@ function OngoGeralModal({
           </div>
         </div>
 
+        {/* Abas */}
+        <div className="flex items-center gap-1 px-5 pt-3 border-b border-zinc-800 shrink-0">
+          {([
+            { key: 'aovivo' as const,    label: 'Ao Vivo' },
+            { key: 'historico' as const, label: 'Histórico' },
+          ]).map(({ key, label }) => (
+            <button
+              key={key}
+              onClick={() => setAba(key)}
+              className={`px-3 py-2 text-xs font-medium border-b-2 transition-colors ${
+                aba === key
+                  ? 'border-violet-500 text-white'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
         {/* Corpo scrollável */}
         <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-4">
 
+          {aba === 'historico' ? (
+            <>
+              <div className="shrink-0">
+                <label className="text-[9px] text-zinc-600 uppercase tracking-wide font-medium block mb-1">Data</label>
+                <input
+                  type="date"
+                  value={dataHistorico}
+                  onChange={e => setDataHistorico(e.target.value)}
+                  className="bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs rounded-lg px-3 py-2.5 focus:outline-none focus:border-violet-500/60"
+                />
+              </div>
+              <div className="border border-zinc-800 rounded-xl overflow-auto flex-1">
+                <table className="w-full text-[11px]">
+                  <thead className="bg-zinc-900 sticky top-0 z-10">
+                    <tr>
+                      {['Data Captura', 'Empresa', 'Produto', 'Rota', 'KG Total', 'KG Restante', 'KG Comprometido', 'KG Carregado', '% Completado', 'Qtd A Caminho', 'Status', 'Data Entrada Ongo'].map(h => (
+                        <th key={h} className="px-3 py-2 text-left text-[10px] font-semibold text-zinc-500 uppercase tracking-wider whitespace-nowrap">{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {historicoRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={12} className="px-3 py-10 text-center text-zinc-600 text-xs">
+                          {historicoLoading ? 'Carregando histórico...' : 'Nenhum registro para esta data.'}
+                        </td>
+                      </tr>
+                    ) : historicoRows.map((r, i) => (
+                      <tr key={i} className="border-b border-zinc-800/40 hover:bg-zinc-800/30">
+                        {['Data Captura', 'Empresa', 'Produto', 'Rota', 'KG Total', 'KG Restante', 'KG Comprometido', 'KG Carregado', '% Completado', 'Qtd A Caminho', 'Status', 'Data Entrada Ongo'].map(col => (
+                          <td key={col} className="px-3 py-2 whitespace-nowrap text-zinc-400">{r[col] || '—'}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+          <>
           {/* Bloco de resumo — real-time, recalcula com os filtros */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 shrink-0">
             <div className="bg-zinc-800/60 border border-zinc-800 rounded-xl px-4 py-3">
@@ -986,6 +1161,8 @@ function OngoGeralModal({
               </tbody>
             </table>
           </div>
+          </>
+          )}
         </div>
       </div>
     </>
@@ -1015,6 +1192,7 @@ export default function TorreDeControle() {
   const [radarOpen,       setRadarOpen]       = useState(false)
   const [timelineData,    setTimelineData]    = useState<TimelineMensagem[]>([])
   const [timelineLoading, setTimelineLoading] = useState(false)
+  const [whatsappCounts,  setWhatsappCounts]  = useState({ cotacoes: 0, avisos: 0 })
 
   const [ongoGeralOpen,    setOngoGeralOpen]    = useState(false)
   const [ongoGeralRows,    setOngoGeralRows]    = useState<CargaOngoGeral[]>([])
@@ -1044,6 +1222,13 @@ export default function TorreDeControle() {
     if (radarOpen) fetchTimeline()
   }, [radarOpen])
 
+  async function marcarTratado(id: string) {
+    setTimelineData(prev => prev.filter(m => m.id !== id))
+    try {
+      await fetch(`/api/whatsapp/timeline/${id}/tratado`, { method: 'PATCH' })
+    } catch { /* item já saiu da tela; próximo fetch resolve se falhar */ }
+  }
+
   const abortFretesRef = useRef<AbortController | null>(null)
 
   const fetchFretes = useCallback(async () => {
@@ -1071,17 +1256,22 @@ export default function TorreDeControle() {
   useEffect(() => {
     const fetchTrizy = async () => {
       try {
-        const [resCount, resCot, resOngo] = await Promise.all([
+        const [resCount, resCot, resOngo, resWpp] = await Promise.all([
           fetch('/api/trizy/count',    { cache: 'no-store' }),
           fetch('/api/trizy/cotacoes', { cache: 'no-store' }),
           fetch('/api/ongo-geral',     { cache: 'no-store' }),
+          fetch('/api/whatsapp/timeline?tipo=todos&limit=1', { cache: 'no-store' }),
         ])
         const dataCount = await resCount.json()
         const dataCot   = await resCot.json()
         const dataOngo  = await resOngo.json()
+        const dataWpp   = await resWpp.json()
         if (typeof dataCount.count === 'number') setTrizyCount(dataCount.count)
         if (Array.isArray(dataCot.cotacoes))      setTrizyCotacoes(dataCot.cotacoes)
         if (Array.isArray(dataOngo.cargas))       setOngoGeralRows(dataOngo.cargas)
+        if (typeof dataWpp.total_cotacao === 'number') {
+          setWhatsappCounts({ cotacoes: dataWpp.total_cotacao, avisos: dataWpp.total_aviso ?? 0 })
+        }
       } catch { /* silencia */ }
       finally { setOngoGeralLoading(false) }
     }
@@ -1166,6 +1356,7 @@ export default function TorreDeControle() {
         onClose={() => setRadarOpen(false)}
         mensagens={timelineData}
         loading={timelineLoading}
+        onTratado={marcarTratado}
       />
 
       <OngoGeralModal
@@ -1223,12 +1414,20 @@ export default function TorreDeControle() {
                 countByFonte(fonte)
               }
               lastUpdate={lastUpdate}
-              active={fonte === 'ongo_cotacao' && filtroFonte === 'ongo_cotacao'}
+              active={
+                (fonte === 'ongo_cotacao' || fonte === 'gmail_cotacao') && filtroFonte === fonte
+              }
               onClick={
                 fonte === 'whatsapp_grupo' ? () => setRadarOpen(true) :
                 fonte === 'ongo_cotacao'   ? () => setFiltroFonte(f => f === 'ongo_cotacao' ? '' : 'ongo_cotacao') :
+                fonte === 'gmail_cotacao'  ? () => setFiltroFonte(f => f === 'gmail_cotacao' ? '' : 'gmail_cotacao') :
                 fonte === 'ongo_geral'     ? () => setOngoGeralOpen(true) :
                 undefined
+              }
+              legenda={
+                fonte === 'whatsapp_grupo'
+                  ? `${whatsappCounts.cotacoes} cotações · ${whatsappCounts.avisos} avisos`
+                  : undefined
               }
             />
           ))}
@@ -1348,12 +1547,9 @@ export default function TorreDeControle() {
                 <select value={filtroStatus} onChange={e => setFiltroStatus(e.target.value as StatusCotacao | '')}
                   className="w-full bg-zinc-800 border border-zinc-700 text-zinc-300 text-xs rounded-lg px-3 py-2.5 focus:outline-none focus:border-emerald-500/60 appearance-none cursor-pointer">
                   <option value="">Todos</option>
-                  <option value="PENDENTE">Pendente</option>
-                  <option value="COTACAO_FILIAL">Cotação Filial</option>
-                  <option value="APROV_DIRETORIA">Aprov. Diretoria</option>
-                  <option value="RESPONDIDA">Respondida</option>
-                  <option value="GANHA">Ganha</option>
-                  <option value="PERDIDA">Perdida</option>
+                  {[...STATUS_OPCOES, 'COTADO_AGUARDANDO' as StatusCotacao].map(s => (
+                    <option key={s} value={s}>{STATUS_CONFIG[s]?.label ?? s}</option>
+                  ))}
                 </select>
               </div>
             </div>
