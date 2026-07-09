@@ -1,7 +1,7 @@
 # NO GRAIN OS — Milestones
 
-**Última atualização:** 2026-07-06  
-**Versão:** 3.2  
+**Última atualização:** 2026-07-07  
+**Versão:** 3.5  
 **Ambiente:** VPS `2.24.201.246` | Backend :8000 | Frontend :3000
 
 ---
@@ -706,26 +706,825 @@ IP de datacenter, decisão já registrada) — mitigação local: retry + alerta
 
 ---
 
+## FASE 7 — Auditoria Comercial GTM + Robustez de I/O
+
+### M23 — Auditoria de UX/GTM da Torre como usuário final ✅
+**Entregue:** 2026-07-07
+
+**Contexto:** auditoria "fast" pedida pelo usuário — navegação ao vivo na Torre em produção
+(Puppeteer, VPS real) sob a ótica de um diretor comercial de logística sênior avaliando o produto
+como algo pra ir a mercado e faturar rápido (ver [[project_torre_gtm_estrategia]]).
+
+**Achados principais (documentados, nem todos ainda corrigidos):**
+- **Ponto cego mais grave:** as 44 cotações do Trizy BID ficavam 100% invisíveis nos KPIs
+  "Pendentes"/"Aguardando Resposta" (esses cards só contam `painel_fretes`) — canal pago sem
+  nenhum alerta de que está parado. Ainda não corrigido (ver backlog).
+- **Gap estratégico:** dashboard "Frete Geral Ongo" (M15) mostra o mundo do embarcador
+  (Agrícola Alvorada), não o da transportadora — mas a estratégia de GTM já definida é vender pras
+  38 transportadoras, não pro embarcador. **Decisão confirmada pelo usuário:** todo trabalho futuro
+  de inteligência/analytics (backlog PRD 9.2 — Score de Compliance, Taxa de Cancelamento, etc.) é
+  sempre pela ótica da transportadora; **não** construir nada client-focused.
+- Ruído de dados: nomes de cliente duplicados no filtro (`Agricola Alvorada`/`Agrícola
+  Alvorada`/`AGRÍCOLA ALVORADA`, `Impasa`/`Inpasa`/`Inpsa`); bug de concatenação nos terminais Ongo
+  (`"A R L AGRICOLA LTDAA R L AGRICOLA LTDA"`); comportamento inconsistente dos 4 cards de fonte
+  (Trizy só filtra a tabela, WhatsApp abre gaveta, Ongo abre modal); mensagem de erro técnica
+  vazando pro usuário final ("verifique se o Next.js está rodando"). Nenhum destes corrigido ainda
+  — ver backlog.
+- RAG de Inteligência de Mercado (M8) confirmado funcionando bem em produção — destacado como
+  ponto forte de venda.
+
+---
+
+### M24 — Grupo WhatsApp de Produção + Fix Classificador (string vazia) ✅
+**Entregue:** 2026-07-07
+
+**Grupo de produção:** `GRUPOS_PERMITIDOS` (`webhook_evolution.py`) restrito a só
+`"120363410106462149@g.us": "Fretes Octamove No Grain"` — removido `COA - Central Agrícola`. JID
+resolvido a partir de link de convite via `GET /group/inviteInfo/octamove?inviteCode=...` (mesmo
+padrão do M22, script `get_group_id.py` já existente reaproveitado).
+
+**Bug de classificação corrigido:** `eh_cotacao` (`webhook_evolution.py`) e o critério equivalente
+em `gmail_service.py` só rejeitavam o valor-sentinela exato `"Não Especificado"` — quando o GPT
+devolvia string vazia `""` (em vez do sentinela) para origem/destino, isso passava como "tem rota"
+e virava uma "cotação" fantasma com todos os campos em branco. Corrigido para tratar `""` igual a
+`"Não Especificado"` nos dois lugares.
+
+**Validado ao vivo com mensagem real de outro número (não a própria instância):**
+- Pipeline completo confirmado ponta a ponta: webhook → GPT → Supabase → Torre.
+- A correção do gate revelou, de bônus, a **primeira amostra real de mensagem "Embarque
+  Liberado"** (`"Liberação de embarque Faz Sol vermelho ID 85748 Ongo- fazer confirmações"`) —
+  esse tipo de mensagem virava cotação fantasma antes do fix; agora cai corretamente como aviso.
+  Parser dedicado para esse tipo de mensagem segue em backlog (ver PRD 9.1), mas agora há uma
+  amostra real para basear a implementação.
+- Registros de teste (painel_fretes + whatsapp_timeline) removidos do Supabase após validação.
+
+---
+
+### M25 — Calculadora reaproveita cálculo já salvo (sem custo de API) ✅
+**Entregue:** 2026-07-07
+
+**Problema:** reabrir uma cotação já calculada (status `CALCULADA` ou além) sempre voltava com o
+painel de resultado em branco — obrigava clicar "Calcular Rota" de novo, gerando chamada nova ao
+QualP mesmo quando `distancia_km`/`pedagio_total_calc`/`antt_piso_por_ton` já estavam salvos na
+cotação (e já apareciam corretamente no Drawer de Auditoria, que já lia esses campos direto —
+só a calculadora não).
+
+**Fix (`app/torre/calcular/[id]/page.tsx`):** novo estado `calculoSalvo`, populado em
+`aplicarItem()` quando a cotação já tem `distancia_km > 0`. Novo card "Último Cálculo Salvo" (KM
+Real/Pedágio/Piso ANTT) exibido acima da seção "Saídas", visível só enquanto não há resultado fresco
+(`calculoSalvo && !resultado`) — mostra os números na hora, sem custo de API.
+
+**Ressalva conhecida (comunicada ao usuário):** o mapa (polyline/pontos de pedágio) não é
+persistido hoje, só os números — o mapa completo ainda exige clicar "Calcular Rota".
+
+---
+
+### M26 — Status otimista na Torre + Correção de infraestrutura de I/O bloqueante ✅
+**Entregue:** 2026-07-07
+
+**Sintoma reportado:** clique para mudar status de uma cotação pra "Filial" não refletia na tela.
+
+**Investigação (não foi só teoria — reproduzido ao vivo):** testes diretos na API confirmaram que o
+`PATCH /cotacoes/{id}/status` gravava certo no Supabase; o problema era só a tela não refletir.
+Cruzando com o log do backend no exato segundo de uma tentativa que **deu timeout de verdade**
+(reproduzido ao vivo via `curl`), achou-se o job semanal de sync ANTT rodando 6 chamadas HTTP
+sequenciais na mesma janela. Investigação mais profunda revelou a causa raiz real: **múltiplos
+pontos do backend faziam chamadas de I/O síncronas (bloqueantes) dentro de handlers/jobs `async`**,
+travando o event loop inteiro do FastAPI (e portanto qualquer outra requisição concorrente,
+incluindo o próprio clique de status) enquanto rodavam.
+
+**Correção de infraestrutura de I/O (a pedido explícito do usuário — `asyncio.to_thread()`):**
+
+| Arquivo | Chamada bloqueante isolada | Frequência |
+|---|---|---|
+| `routers/fretes.py` | Leitura Sheets + Supabase (`GET /fretes`) | a cada 5s — poll de toda aba aberta da Torre; era o offensor mais frequente, não estava na lista original do usuário mas era essencial pro fix funcionar de fato |
+| `services/gmail_service.py` | Chamadas do Gmail API (`list` + `get` por e-mail) | a cada 1 min |
+| `routers/cotacoes.py` | Update de status/preço/cálculo/dados (`_update`/`_update_trizy`) | a cada ação do comercial — o endpoint do bug reportado |
+| `routers/webhook_evolution.py` | Gravação de cotação (`inserir_frete`) + timeline (`salvar_mensagem_timeline`) | a cada mensagem de grupo autorizado |
+| `services/antt_crawler.py` | Upsert dos coeficientes ANTT (`_persistir_coeficientes`) | semanal — o gatilho que expôs o problema |
+
+**Fix complementar na UI (`app/page.tsx`):** `updateStatus()` agora é otimista — atualiza a tela na
+hora do clique e só reverte (com toast) se o PATCH realmente falhar, em vez de esperar a resposta
+de rede pra refletir qualquer coisa. Timeout do proxy Next.js (`app/api/cotacoes/[id]/route.ts`)
+aumentado de 5s → 15s como margem extra.
+
+**Validado ao vivo, pós-deploy:**
+- `GET /fretes` (2,3s) e `PATCH /cotacoes/{id}/status` disparados em paralelo — o PATCH voltou em
+  0,64s sem esperar o `/fretes` terminar (antes, uma bloqueava a outra).
+- Ciclo seguinte do Gmail (`asyncio.to_thread` na chamada mais delicada, com closures em loop)
+  rodou limpo, sem erro, mesmo resultado de sempre (8 e-mails, 0 injetados/erros).
+- `npx tsc --noEmit` limpo antes do deploy do frontend.
+
+**Nota importante — comportamento por design, não bug:** quando o status vira `COTACAO_FILIAL`/
+`APROV_DIRETORIA`/`RESPONDIDA`/`COTADO_AGUARDANDO`, a cotação sai do Radar ativo de propósito
+(cluster "Aguardando Resposta", ver M13) — pode parecer que "sumiu" mas é comportamento esperado.
+
+**Backlog fechado em 2026-07-07** (mesma classe de bug, frequência menor, não bloqueava o sintoma
+reportado): `routers/whatsapp_timeline.py` e `services/rag_service.py` corrigidos com
+`asyncio.to_thread()`, mesmo padrão. `services/sheets_service.py` era o único item que sobrou —
+auditado e confirmado como código morto (nenhum handler o chama hoje), não representa risco.
+
+---
+
+## FASE 8 — Cérebro Central & Roteamento Omnichannel
+
+**Contexto:** com o motor assíncrono validado no M26 (PATCH de status caindo de bloqueante para
+0,64s), o usuário definiu o Master PRD completo da Fase 4 — ver PRD.md 9.5 para a visão de produto,
+a decisão de "sem chat livre para o operador" e o mapa de arquivos afetados.
+
+**⚠️ Renumeração:** a numeração original do pedido (M16/M17/M18) colidia com milestones já entregues
+(`M16` Gmail Anti-Ruído, `M17` Precisão Geográfica QualP) e já reservados no backlog (`M18.1-M18.6`
+Ongo transportadora). Renumerado para **M27/M28/M29**, continuando de onde a FASE 7 parou (M26).
+
+### M27 — Ativação do Cérebro, Visibilidade e Alertas Táticos ✅
+**Entregue:** 2026-07-07
+
+**M27.1 — Cérebro Central (`torre_memoria_global`):**
+- `backend/torre_memoria_global_migration.sql` (⏳ **precisa rodar em produção** — ainda não aplicada
+  no Supabase, mesmo fluxo manual via SQL Editor já usado nas migrations anteriores): tabela
+  `fonte`/`identificador_origem`/`entidade_cliente`/`texto_resumo`/`embedding VECTOR(1536)`, índice
+  único `(fonte, identificador_origem)` (upsert em vez de duplicar ao reingerir o mesmo registro),
+  índice ivfflat cosine + RPC `buscar_memoria_similar()` (mesmo padrão de `buscar_fretes_similares`,
+  M8) já pronta para uso futuro (RAG cross-canal, M28.1, Paper de Índices em stand-by).
+- `backend/services/memoria_global_service.py` — `indexar_memoria()` async, reaproveita o mesmo
+  padrão de `rag_service.py` (embedding `text-embedding-3-small` + upsert). Disparado via
+  `asyncio.create_task` (fire-and-forget, não bloqueia a resposta) em:
+  - `routers/webhook_evolution.py` — cotação **e** aviso de mercado (toda mensagem de grupo
+    autorizado vira fragmento; `identificador_origem` = `key.id` da mensagem Evolution).
+  - `services/gmail_service.py` — todo e-mail injetado com sucesso (`identificador_origem` = 
+    `msg_id` Gmail).
+- `memoria_global.py` (raiz, novo) — versão **síncrona** do mesmo serviço, para os dois scripts
+  locais (Trizy/Ongo rodam fora do FastAPI, via Task Scheduler): mesmo modelo de embedding, mesma
+  tabela, best-effort (nunca derruba o script chamador, mesmo padrão de `whatsapp_alert.py`).
+  - `trizy_extractor.py::upsert_smart()` — indexa só os BIDs **novos** do ciclo (updates não geram
+    fragmento novo, já têm um da primeira ingestão).
+  - `extract_ongo.py::_upsert_cargas_ongo()` — ganhou parâmetro `new_ids` (já calculado em
+    `run_cycle()` para o `first_seen_cache`); indexa só os lotes genuinamente novos do ciclo.
+- **Decisão de escopo:** só registros **novos** geram fragmento (não cada re-sincronização de
+  registro já existente) — evita custo de embedding redundante em ciclos diários com centenas de
+  linhas inalteradas, mantendo o espírito de "toda ingestão gera memória" sem desperdício.
+
+**M27.2 — Fim do ponto cego Trizy nos KPIs:**
+- Causa raiz (achado M23: "44 cotações Trizy invisíveis em Pendentes"): `totalPendentes`
+  (`app/page.tsx`) só contava `status === 'PENDENTE'`, mas cotações Trizy nunca têm esse status —
+  entram como `RECEBIDA` (normalização do M12, `status_crm='Novo'` → `RECEBIDA`) e só saem dali
+  quando avançam pro cluster `STATUS_AGUARDANDO` ou fecham. Card "Pendentes" mostrava só
+  `painel_fretes`, apesar de `cotacoes` (a lista mesclada) já incluir `trizyCotacoes` desde antes.
+- Fix: `totalPendentes` redefinido como "não finalizada (Ganha/Perdida) e não no cluster Aguardando"
+  — cobre `RECEBIDA`/`CALCULADA`/`PENDENTE`/sem status, de qualquer fonte. O clique no card
+  "Pendentes" (`statusOk` em `cotacoesVisiveis`) foi ajustado com a mesma regra, para o filtro bater
+  com a contagem do KPI.
+
+**M27.3 — Normalização semântica de clientes:**
+- `frontend-torre/lib/cliente.ts` (novo) — `chaveCliente()` colapsa por acento/caixa (NFD + strip de
+  diacríticos + lowercase) e por alias explícito para os erros de digitação reais que não são só
+  capitalização (`Inpasa`/`Inpsa` → `Impasa`, achado M23). `construirMapaClientes()` escolhe o
+  rótulo "canônico" por chave via heurística (penaliza tudo-maiúsculo, premia acentuação).
+- `app/page.tsx`: `clientesUnicos` (dropdown do filtro) e o predicado `clienteOk` passaram a usar o
+  mapa canônico — `Agricola Alvorada`/`AGRÍCOLA ALVORADA`/`Agrícola Alvorada` agora aparecem como
+  uma única opção no filtro e filtram todas as variantes de uma vez.
+
+**M27.4 — Anti-zeramento do `COTADO_AGUARDANDO`:** auditado a pedido do Master PRD — **nenhum job
+hoje toca status de `painel_fretes`/`octamove_extracao_trizy` à meia-noite ou em qualquer cron**.
+`main.py` só agenda `gmail_job` (1min) e `antt_sync_job` (semanal, só mexe em `antt_coeficientes`);
+o cron das 23:55 (`run_ongo_diario.bat` → `extract_ongo.py`/`fechamento_ongo_diario.py`) só escreve
+em `cargas_ongo`/`historico_fechamentos`, nunca em `painel_fretes`. **Não havia bug ativo** — item
+tratado como verificação preventiva (documentada aqui para não reabrir a dúvida numa próxima
+auditoria); vira ponto de atenção real só quando M29.2 (Gatilho de Auto-Loss) for implementado.
+
+**M27.5 — Barra de Alerta Tático:**
+- `frontend-torre/app/api/torre/alertas-pendentes/route.ts` (novo, mesmo padrão REST cru contra o
+  PostgREST de `app/api/trizy/cotacoes/route.ts`) — cruza `painel_fretes` (por
+  `status_atualizado_em`) e `octamove_extracao_trizy` (por `criado_em`, proxy — **limitação
+  conhecida:** Trizy não tem coluna própria de "última mudança de status", ver Armadilhas) filtrando
+  o cluster `STATUS_AGUARDANDO` parado há mais de 3 dias.
+- `app/page.tsx`: banner vermelho discreto no topo da Torre (acima dos source cards), polling 60s,
+  só renderiza quando há itens. Clique aciona `abrirAlertasPendentes()` — ativa o toggle "Aguardando
+  Resposta" já existente (M13) e restringe adicionalmente a um novo `Set` de IDs
+  (`filtroAlertaIds`) para isolar exatamente os itens estagnados, reaproveitando toda a UI de
+  resolução em lote já existente (drawer, GANHA/PERDIDA) sem duplicar componente.
+
+**Validado:** `npx tsc --noEmit` e `npm run build` limpos em `frontend-torre` (13 rotas geradas,
+incluindo `/api/torre/alertas-pendentes` nova); `python -m py_compile` limpo nos 4 arquivos backend e
+nos 3 scripts locais editados/criados (`trizy_extractor.py`, `extract_ongo.py`, `memoria_global.py`).
+
+**Migration aplicada em produção (2026-07-07):** rodada pelo usuário via SQL Editor em duas partes
+(`torre_memoria_global_migration_parte1.sql` + `_parte2.sql`) — a versão original em arquivo único
+falhou (`operator class "vector_c" does not exist for access method "ivfflat"`, texto truncado no
+copy-paste do editor web, mesma classe de armadilha já vista em migrations anteriores) e derrubou o
+`CREATE TABLE` inteiro junto por estarem na mesma transação implícita. Separado em Parte 1 (tabela +
+índices essenciais + RPC, sem ivfflat) e Parte 2 (índice ivfflat isolado) — as duas rodaram com
+sucesso na segunda tentativa.
+
+**Webhook WhatsApp testado ao vivo, ponta a ponta (2026-07-07):** chamada direta de
+`receber_mensagem_whatsapp()` com payload simulado do grupo autorizado (mesmo padrão de teste sem
+subir servidor já usado no fix do M14/QualP). Dois ciclos:
+1. **Antes da migration:** pipeline completo funcionou (texto → GPT-4o-mini → geocoding →
+   `painel_fretes` + `whatsapp_timeline`); hook de memória falhou como esperado
+   (`PGRST205 — Could not find the table 'public.torre_memoria_global'`), sem derrubar o webhook —
+   confirma que o design best-effort funciona.
+2. **Depois da migration:** mesmo teste, fragmento real gravado em `torre_memoria_global` com
+   embedding de 1536 dimensões, `fonte='whatsapp'`, `entidade_cliente` resolvido corretamente pelo
+   `domain_map.resolver_whatsapp()` do grupo. RPC `buscar_memoria_similar` confirmada ativa via
+   chamada direta.
+- Registros de teste (`painel_fretes`, `whatsapp_timeline`, `torre_memoria_global`) removidos do
+  Supabase após validação, nos dois ciclos.
+- **Achado de bônus (não é bug):** ao imprimir os dados no console Windows local, caracteres
+  acentuados apareceram como `�` (`Rondon�polis`) — verificado byte-a-byte contra o valor real
+  gravado no Supabase (`Rondonópolis`, UTF-8 correto) e confirmado que é só artefato de exibição do
+  terminal cp1252, não corrupção de dado — mesma conclusão já registrada no M21 para o mojibake do
+  Sheets.
+- **Não testado nesta rodada:** fluxo real via Evolution API/WhatsApp de verdade na VPS (o teste foi
+  chamada direta da função Python, não uma mensagem real chegando pelo webhook em produção).
+
+### M28 — Roteamento Omnichannel e Inteligência Injetada ⚙️ parcial
+**Entregue:** 2026-07-07 — só M28.1. Ver PRD.md 9.5 para a especificação completa.
+
+**M28.1 — Botão "Sugerir Preço" (RAG Injetado) ✅:**
+- `frontend-torre/app/torre/calcular/[id]/page.tsx` — `ragMedia` (média dos top-5 fechamentos
+  similares, mesmo dado já buscado pra alimentar o painel "Inteligência de Mercado" — zero chamada
+  de API extra) agora aparece como botão `Sugerir Preço (R$ X/t)` ao lado do label do campo "Preço
+  Proposto"; clique preenche `precoTon` direto, sem digitação manual. Painel RAG (`media` local)
+  refatorado para reusar o mesmo `ragMedia`, evitando cálculo duplicado.
+
+**M28.2 — Roteamento condicional de saída por `cotacao.fonte` ❌ não iniciado:** Trizy (link direto
+do BID) é trivial; Gmail (rascunho de e-mail via API) **bloqueado** — precisa escopo novo de OAuth
+(`gmail.send`, hoje só `gmail.readonly`), o que exige o usuário re-autorizar a conta
+`octamoveai@gmail.com` num fluxo de consentimento no navegador (não automatizável por mim). WhatsApp
+(payload + disparo Evolution) é viável mas precisa de um campo novo (`remote_jid` de origem) em
+`painel_fretes` — hoje só `whatsapp_timeline` guarda o grupo, não a thread/número exato pra
+responder. Fica pra uma rodada dedicada.
+
+### M29 — Automações Comerciais e Limpeza ⚙️ parcial
+**Entregue:** 2026-07-07 — M29.1, M29.2, M29.3 implementados; envio real do M29.3 não testado em
+produção (ver nota abaixo). Ver PRD.md 9.5 para a especificação completa.
+
+**M29.1 — Reprecificação Semântica (Market Shift) ✅:** mesmo arquivo/mesma chamada RAG do M28.1 —
+`marketShift` compara a média dos fechamentos das últimas 48h contra a média do resto da janela de
+30 dias já trazida pelo RAG (sem query nova). Oscilação ≥ 10% dispara alerta visual (vermelho/alta,
+azul/queda) no painel "Inteligência de Mercado" da calculadora, com os dois valores e o percentual.
+
+**M29.2 — Gatilho de Auto-Loss ✅:** `backend/services/auto_loss_service.py` — job diário (06:00 UTC
+/ 03:00 BRT, `main.py`) arquiva como `PERDIDA` cotações do cluster `STATUS_AGUARDANDO`
+(`COTACAO_FILIAL`/`APROV_DIRETORIA`/`RESPONDIDA`/`COTADO_AGUARDANDO`) paradas há mais de 5 dias úteis
+(`_data_limite_dias_uteis()`, conta só seg-sex). Cobre `painel_fretes` (por `status_atualizado_em`) e
+`octamove_extracao_trizy` (por `criado_em`, mesma limitação documentada no M27.5/Armadilhas).
+Anexa `[Auto-Loss] Expirada sem retorno após 5 dias úteis parada.` em `observacoes`/
+`observacao_interna` (append, não sobrescreve) em vez de criar coluna `motivo_perda` nova — evita
+mais uma migration. **É aqui que a verificação do M27.4 passa a valer de verdade**, já que este é o
+primeiro job que efetivamente toca status em lote.
+
+**M29.3 — Despertador Matinal (WhatsApp Digest) ⚙️:** `backend/services/digest_service.py` +
+`backend/services/evolution_service.py` (novo, `enviar_mensagem_whatsapp()` genérico — mesmo
+payload/endpoint já validado ao vivo pelo `whatsapp_alert.py` local no M22). Job diário (10:45 UTC /
+07:45 BRT) consolida contagem + "valor comercial em risco" (soma de `painel_fretes.valor_total` +
+`trizy.peso_toneladas × valor_proposto_ton` do cluster `STATUS_AGUARDANDO`) e dispara resumo pro
+grupo autorizado (`GRUPOS_PERMITIDOS`, único hoje desde o M24). **Aproximação documentada:** "margem
+financeira em risco" foi implementada como valor comercial total das cotações paradas (não a margem
+líquida vs. piso ANTT) — dado mais direto de calcular sem exigir piso ANTT salvo em todas as linhas;
+revisar se o time comercial achar a métrica confusa.
+
+**Validado:** `tsc --noEmit`/`next build` limpos; `py_compile` limpo em `main.py` + 3 services
+novos. `arquivar_cotacoes_expiradas()` **rodado de verdade contra produção** (0 candidatos reais
+hoje — sem risco, confirmado via SELECT antes de rodar o UPDATE). `_consolidar_sync()` do digest
+rodado de verdade — números reais confirmados (7 cotações, R$ 570.000,00 em risco). **Envio real
+confirmado em 2026-07-08** — usuário recebeu a mensagem no grupo "Fretes Octamove No Grain" com o
+formato exato esperado. M29.3 100% validado ponta a ponta.
+
+---
+
+### Addendum M27 — Backfill do Cérebro Central + fix de qualidade dos dados do Ongo
+**Entregue:** 2026-07-07
+
+**Backfill (`backend/backfill_memoria_global.py`, novo):** script único, idempotente
+(upsert por `fonte`+`identificador_origem`, mesmo par usado pelos hooks ao vivo — pode rodar de novo
+sem duplicar) que indexou o histórico já existente em `torre_memoria_global`: 103 linhas de
+`painel_fretes` (WhatsApp+Gmail), 44 do Trizy, 221 do Ongo. Rodado 3x (idempotente, sem custo de
+duplicar) pra cobrir timeouts pontuais de embedding — resultado final: **362/368 (98,4%)** —
+Trizy 44/44, Ongo 216/221, WhatsApp+Gmail 102/103. Resíduo de 6 registros com timeout persistente,
+sem impacto prático (massa histórica já robusta em todas as 4 fontes).
+
+**Achado durante a checagem do RAG (a pedido do usuário, que notou que o Ongo gera dado todo dia):**
+`historico_fechamentos` (tabela real usada pela busca RAG — não confundir com `cargas_ongo`, que é só
+o snapshot bruto diário) tinha só 288 linhas, de só 2 datas (04/07 e 06/07) — o cron das 23:55 não
+rodou todo dia (limitação já conhecida: depende do notebook ligado). 286 dessas 288 vinham do Ongo,
+com `origem`/`destino` gravados como **código+nome de fazenda/terminal**
+(`"0003123849-A R L AGRICOLA LTDA..."`) em vez de cidade/UF — o município real só existia num campo
+separado (`cargas_ongo.municipio_origem`) nunca usado na montagem do texto do RAG. Isso degradava a
+qualidade do match semântico do M28.1 (Sugerir Preço) especificamente pras rotas do Ongo (comparar
+"Sorriso/MT" contra um código de fazenda não bate bem por cosine similarity).
+
+**Fix (3 pontos, mesma causa raiz — só leitura de campo já existente, `cargas_ongo` em si não foi
+alterado, "veracidade" do dado extraído preservada 100%):**
+- `fechamento_ongo_diario.py::_agrupar_por_rota_produto()` — origem agora usa `municipio_origem`
+  (fallback pro código limpo se vazio); destino tem o prefixo numérico removido
+  (`_limpar_nome_terminal()`, mesmo padrão do `_strip_code_prefix()` já usado no `extract_ongo.py`).
+- `extract_ongo.py` — hook do M27.1 (`_upsert_cargas_ongo()`) atualizado com a mesma lógica,
+  reaproveitando `_strip_code_prefix()` já existente no módulo.
+- `backend/backfill_memoria_global.py::_texto_ongo()` — mesma correção (novo helper local
+  `_limpar_nome_terminal()`, já que é um script backend separado do `extract_ongo.py`).
+
+**Validado (dry-run, só leitura):** rodada a função `_agrupar_por_rota_produto` + `_montar_texto`
+contra 20 linhas reais de `cargas_ongo` — antes `"Frete de SOJA... de 0003123849-A R L AGRICOLA
+LTDA... para 0003091996-COFCO..."`, depois `"Frete de SOJA EM GRAOS 2 de TESOURO para COFCO
+INTERNATIONAL BRASIL S.A."` — lê como rota de verdade agora.
+
+**Limpeza:** os 207 fragmentos do Ongo já indexados em `torre_memoria_global` com o texto antigo
+foram apagados e reindexados com o texto corrigido (backfill é idempotente, sem custo extra de
+duplicar as outras fontes).
+
+**Não corrigido nesta rodada (decisão deliberada):** as 286 linhas já existentes em
+`historico_fechamentos` (04/07 e 06/07) mantêm o formato antigo — `historico_fechamentos` não guarda
+`link_id_carga` nem `municipio_origem`, então não dá pra corrigir essas linhas com segurança sem
+arriscar inventar dado que não foi extraído junto com aquele fechamento específico. Ficam como ruído
+legado; diluem-se naturalmente conforme fechamentos novos (já corrigidos) se acumulam a partir de
+hoje.
+
+---
+
+## FASE 9 — Inteligência Competitiva Trizy & Efetividade Comercial ✅
+**Entregue:** 2026-07-07
+
+**Contexto:** dois achados da conversa pós-M29 — (1) `octamove_extracao_trizy.status_interno`
+("Sem Oferta"/"Perdendo"/"Negociando"/"Encerrado"/"Operando") já era capturado e exibido como texto no
+Drawer, mas não alimentava SLA/KPI/alerta nenhum — sinal de mercado competitivo desperdiçado; (2) a
+normalização de cliente do M27.3 destravou uma análise que antes seria imprecisa: efetividade
+comercial (taxa de conversão, ticket médio) por cliente.
+
+### M30 — Alerta Competitivo Trizy ✅
+- **Achado-chave que baratou tudo:** `/api/trizy/cotacoes` já retornava `status_trizy` em todo ciclo
+  de polling (10s) — zero endpoint novo, zero mudança de backend.
+- `bidsTrizyEmRisco` (`useMemo`, `app/page.tsx`) — BIDs com `status_trizy IN ('Perdendo', 'Encerrado')`
+  E `status NOT IN ('GANHA', 'PERDIDA')` (não alerta sobre BID que já fechamos por conta própria).
+- Banner laranja (distinto do vermelho do M27.5 — é urgência de mercado externo, não SLA interno),
+  reaproveita o `filtroAlertaIds` já existente do M27.5.
+- **Fix necessário no meio do caminho:** o gate de "oculta cluster Aguardando por padrão"
+  (`cotacoesVisiveis`) rodava *antes* do `filtroAlertaIds` — um BID "Perdendo" que já estivesse em
+  `COTACAO_FILIAL` (cluster Aguardando) sumiria do clique do alerta. Corrigido: quando
+  `filtroAlertaIds` está ativo, ele passa a ter prioridade total (bypassa o ocultamento de cluster),
+  já que um alerta tático aponta exatamente os ids relevantes, independente da etapa do funil —
+  correção vale tanto pro M27.5 quanto pro M30.
+
+### M31 — Painel de Efetividade Comercial por Cliente ✅
+- Novo componente `EfetividadeModal` (`app/page.tsx`, mesmo padrão visual do `OngoGeralModal`) —
+  agregação 100% client-side (`useMemo`) sobre `cotacoes` (WhatsApp+Gmail+Trizy — **Ongo Geral fica
+  de fora**, mede volume de mercado bruto, não cotação nossa), usando o cliente já normalizado pelo
+  M27.3 (`mapaClientes`/`chaveCliente`) — sem essa dependência, "Agrícola Alvorada" contaria 3 vezes.
+- Métricas por cliente: total, ganhas, perdidas, em andamento, taxa de conversão
+  (`ganhas / (ganhas + perdidas)`), ticket médio (preço médio das GANHAS).
+- Resumo no topo: taxa de conversão geral da carteira, cliente com melhor conversão (mínimo 2
+  desfechos pra não destacar outlier de amostra 1), total de cotações no período.
+- Filtro de período (30/60/90 dias / tudo) — filtra por `criado_em`.
+- Acesso via botão dedicado no header ("Efetividade Comercial") — não é source card, é visão
+  analítica, não fonte de ingestão.
+- **Nota de GTM (fora de escopo agora):** mesma lógica serviria pra medir efetividade por
+  transportadora parceira se/quando virar produto B2B2B pras 38 transportadoras da estratégia GTM.
+
+**Validado:** `npx tsc --noEmit` e `npm run build` limpos (13 rotas, sem rota nova — M30/M31 são
+100% frontend, sem endpoint novo). Deploy feito na VPS (`deploy_vps.py`), health check OK.
+
+**Testado ao vivo no navegador (Puppeteer, VPS real, 2026-07-07) — os dois com dado real:**
+- **M30:** banner apareceu de cara com **13 BIDs Trizy em risco** (dado real, não estimado). Clique
+  filtrou o Radar pra exatamente os 13 (card Trizy BID + dropdown Origem do Dado ficaram ativos).
+  Aberto um BID (`#00067435`, SIPAL INDUSTRIA) na Auditoria: `Status Trizy: Encerrado`, `status`
+  ainda `Recebida` — bate exatamente com o filtro do alerta.
+- **M31:** aberto com dado real — 74 cotações, 18 clientes distintos, taxa de conversão geral 100%
+  (1 ganha/0 perdidas). "Impasa" aparece como uma única linha (não split em Impasa/Inpasa/Inpsa) —
+  confirma que a normalização do M27.3 alimenta essa agregação corretamente. "Melhor Conversão"
+  mostrou "sem dado suficiente" corretamente (só 1 fechamento real no sistema até agora, abaixo do
+  mínimo de 2 desfechos pra evitar destacar outlier de amostra 1). Filtro de período (30/60/90d)
+  trocou de aba sem erro — números idênticos nos 3 porque todo o dataset tem ~2 semanas (nada mais
+  antigo pra diferenciar ainda, não é bug).
+- **Achado no teste (não é bug do M30/M31):** ao testar o fechamento do Drawer via clique
+  programático, dois modais (Drawer + Efetividade) ficaram abertos simultaneamente — são estados
+  React independentes (`drawerItem` / `efetividadeOpen`), então não há exclusão mútua entre eles.
+  Não trava nem quebra nada, só empilha visualmente; não é um caso de uso real (usuário não abre os
+  dois de propósito), então não foi tratado como bug — anotado caso vire irritante na prática.
+
+### M31.1 — Efetividade Comercial promovida de modal pra aba própria ✅
+**Entregue:** 2026-07-08
+
+**Motivação (feedback do usuário):** um modal com presets fixos (30/60/90d/tudo) é uma visão
+passageira; pra virar ferramenta de gestão de verdade (o dono medindo o time comercial ao longo do
+tempo, "vender visão e decisão baseada em dado"), precisa ser uma seção permanente com filtro de
+data real, não só atalhos fixos. Confirmado com o usuário que a métrica é **por time/funil**, não
+por vendedor individual — a Torre não tem login/autenticação hoje, então atribuição por operador
+individual ficaria fora de escopo (exigiria construir autenticação do zero).
+
+**Mudanças:**
+- Nova rota `frontend-torre/app/torre/efetividade/page.tsx` — página própria (mesmo padrão de
+  `torre/calcular/[id]`: header fino com botão "← Radar", busca os próprios dados via
+  `/api/fretes` + `/api/trizy/cotacoes`, não depende mais do estado da página principal).
+  `EfetividadeModal` removido de `app/page.tsx`; botão do header agora faz
+  `router.push('/torre/efetividade')`.
+- **Filtro de data real** (`<input type="date">` De/Até) além dos presets rápidos (7/30/60/90
+  dias, que só preenchem os dois inputs) — dá pra escolher qualquer intervalo exato, não só janelas
+  fixas contadas a partir de hoje.
+- `isLixoCotacao()` extraído de `app/page.tsx` pra `lib/cotacao.ts` (novo) — compartilhado entre a
+  página principal e a nova rota, evita duplicar a lógica de "cotação fantasma".
+
+**Validado ao vivo (Puppeteer, VPS real):** nova URL renderiza com header próprio; preset "7 dias"
+mudou os inputs de data pra `01/07/2026 – 08/07/2026` e recalculou de **74 cotações/18 clientes**
+(janela "Tudo") pra **7 cotações/5 clientes** — confirma que o filtro de data funciona de verdade,
+não é só cosmético.
+
+---
+
+## FASE 10 — Valor pra Transportadora (Ongo) — planejado, não iniciado
+
+**Origem:** Varredura Clínica do Portal Ongo (PRD.md §9.2, 2026-07-04) — seis oportunidades de dado
+nativo do portal `painel.ongocargas.com.br` que hoje **não são extraídas** (`extract_ongo.py` só
+cobre `/carregamentos` e `/agendamentos`), cada uma vendável como inteligência pra transportadora
+(estratégia GTM confirmada — ótica da transportadora, nunca do embarcador, ver
+[[project_torre_gtm_estrategia]]). Renumerado de `M18.1-M18.6` (rótulo antigo do backlog) pra
+`M32-M37`, continuando a numeração real do projeto (parou em M31).
+
+**Decisões de arquitetura (atualizadas em 2026-07-08 após revisão do usuário), valem pras seis:**
+- **UI — revisado:** `extract_ongo.py` já empurra pra **7 abas do Sheets** hoje (Carregamentos,
+  Agendamentos, Aderência, Lances, Análise por Oferta, Histórico, Análise Mensal, AUDITORIA) — já
+  existe um sistema de relatório dentro do Sheets, não é um sistema novo. Decisão: as novas abas do
+  M32-M37 seguem esse mesmo padrão (Python computa/formata, empurra pra aba nova), e o **dashboard em
+  si é montado no Looker Studio** (gratuito, Google) conectado direto nessas abas — em vez de React
+  customizado por métrica. Botão "Abrir Dashboard" na Torre passa a abrir o relatório Looker
+  (embed ou link); "Ver Planilha" continua abrindo a aba crua por trás, mesmo padrão de escape hatch.
+- **⚠️ Looker só exibe, não dispara ação:** a lógica de gatilho do M32 (alerta) e do M36 (disparo
+  WhatsApp) continua tendo que rodar em Python (`extract_ongo.py`/cron), independente da escolha de
+  dashboard — Looker não substitui isso, só a camada de visualização/filtro.
+- **Dado:** Supabase segue como fonte de verdade só onde precisa de cruzamento que o Sheets não faz
+  bem (ex.: Score por CPF do M35, que depende do M33); o resto vive só no Sheets+Looker.
+- **"Tempo real" com ressalva:** reflete o último ciclo de extração do `extract_ongo.py` — não é uma
+  tela viva atualizando sozinha o dia inteiro, porque o scraper não é um serviço sempre ligado.
+- **Risco anti-bot — decisão (2026-07-08):** mesma lógica do stand-by do Trizy Lance — não vale
+  endurecer produção pra uma conta que não é cliente pagante ainda (`Nova Frota`). O scraping novo
+  do M32-M37 roda **manual/sob demanda** por enquanto, fora do cron automático das 23:55; cada aba
+  nova é testada manualmente primeiro (observando se dá CAPTCHA/bloqueio) antes de cogitar automatizar.
+  O investimento "de verdade" em anti-bot (proxy residencial + Scrapling no Ongo) fica adiado até
+  existir cliente pagante que dependa disso em produção.
+
+**Prioridade recomendada (herdada do audit original — impacto x esforço):**
+
+### M32 — Alerta "Sem Localização" ✅
+**Entregue:** 2026-07-08
+
+**Descoberta técnica (exploração única, 1 login, ver nota de risco abaixo):** o widget nativo
+"Sem Localização" do Dashboard Ongo é alimentado por
+`v2/api/DashboardCargas/listagem-all-dashboard-geolocations` — cada registro já vem com um campo
+`isOffline` (booleano, calculado pelo próprio Ongo) — não precisei inventar um limiar de horas por
+conta própria, só usar o critério que o portal já usa.
+
+**Implementado (`extract_ongo.py`):**
+- `_fetch_geolocations()` — **v2, corrigida em 2026-07-08 após diagnóstico ao vivo** (ver abaixo).
+- `_detectar_sem_localizacao()` — pega o ping mais recente por `idFrete`, filtra `isOffline=true`.
+- Alerta via `whatsapp_alert.py::alertar_sem_localizacao()` (nova função, reaproveita o mesmo
+  `_enviar_texto()` — refatorado de dentro de `alertar_falha` pra não duplicar a chamada HTTP).
+- Aba "Sem Localização" no Sheets (full-refresh a cada ciclo) — fonte pro Looker Studio.
+- **Sem tabela Supabase nova** — é estado momentâneo (snapshot), não precisa de histórico acumulado
+  como o M34 precisa.
+
+**Teste ao vivo (2026-07-08) achou um bug real:** rodei `extract_ongo.py` de verdade (modo monitor
+contínuo, 6 varreduras) — ciclo principal, M34 e tudo mais funcionaram perfeitamente, mas o M32
+reportou **0 caminhões sem localização em todas as 6 varreduras**, divergindo do "10" visto ao vivo
+no widget do Dashboard horas antes. Investigação dedicada (`diag_m32.py`, script descartável, 1 login
+a mais reaproveitando `_login`/`_fetch_lista` reais): a v1 de `_fetch_geolocations()` tentava
+**replicar** a chamada via `fetch()` cru dentro do browser, usando os headers de auth capturados por
+`_fetch_lista()` — a API respondia `200 OK` com `"success": true, "data": []` (vazio, sem erro),
+porque **esse endpoint só populua de verdade quando o próprio JS do Dashboard o dispara** ao carregar
+o widget "Cargas no Mapa", não quando chamado manualmente de fora.
+
+**Fix:** `_fetch_geolocations()` reescrita pra escutar passivamente a resposta (`page.on("response")`)
+enquanto navega de verdade pro Dashboard (`PAINEL_URL`) — exatamente o mesmo padrão comprovado que
+`_fetch_lista()` já usa pro `/carregamentos`. Não depende mais de `api_headers` (removido da
+assinatura). Isso adiciona uma navegação extra ao Dashboard por ciclo (poucos segundos).
+
+**Validado:** lógica de detecção (`_detectar_sem_localizacao`) testada offline com dado sintético —
+correta. `python -m py_compile` limpo após o fix. **Re-testado ao vivo em 2026-07-08 via
+`run_ongo_once.py`** (pedido do usuário, 5ª sessão do dia): confirmado — `M32: 30 caminhão(ões) sem
+localização` (antes do fix: 0 em 6 varreduras seguidas). Alerta WhatsApp disparado de verdade com a
+lista (limitada aos 10 primeiros). M32 está **100% funcional e validado ponta a ponta**.
+
+### M33 — Extrator "Fretes Cancelados" + "Troca de Nota" — não iniciado
+**Fonte:** duas seções não cobertas — Relatórios Administrativos > Fretes Cancelados (~18%/semana na
+amostra) e aba Troca de Nota (~35%/semana cancelada na amostra).
+**Bloqueio técnico:** URLs tentadas (`/troca-de-nota`, `/relatorios`) redirecionaram de volta pro
+Dashboard na exploração de 2026-07-08 — não são os slugs corretos. Precisa de uma exploração mais
+dirigida (clicar pelo menu real da UI, não adivinhar URL) antes de implementar.
+
+### M34 — Score de Compliance de Descarga ✅
+**Entregue:** 2026-07-08
+
+**Descoberta técnica:** endpoint `v1/api/Frete/listagem-analise-descarga/{pageSize}/{pageIndex}/
+{dataIni}/{dataFim}/null/null/null/null` — retorna exatamente os campos do achado original
+(`desligouLocalizacao`, `substituicaoFotoDescarga`, foto do canhoto) por descarga, com um array
+`children` (1 carga pode ter múltiplos destinos).
+
+**Implementado (`extract_ongo.py`):**
+- `_fetch_analise_descarga()` — mesma técnica de `page.evaluate(fetch)` com headers reaproveitados,
+  janela de 4 dias por padrão.
+- `_map_descarga_rows()` — achata `children` em linhas simples pro Sheets.
+- **Decisão de veracidade:** os campos booleanos (`Desligou Localização`, `Substituiu Foto`, `Tem
+  Foto`) são expostos crus (Sim/Não) — **não inventei** a fórmula do score "X/4" visto na UI do
+  portal, já que não confirmei o cálculo exato; melhor mostrar os componentes reais do que uma
+  pontuação adivinhada.
+- `_upsert_descarregamentos()` + `backend/ongo_descarregamentos_migration.sql` (tabela nova, dedup
+  por `id_cotacao+id_frete_destino`) — Supabase aqui sim, porque o valor real é o score agregado por
+  motorista/transportadora **ao longo do tempo**, que o Sheets sozinho não calcula bem.
+- Aba "Descarregamentos" no Sheets — fonte pro Looker Studio.
+- Vendável separadamente ao embarcador como "auditoria terceirizada" (nota: exceção à regra "sempre
+  ótica transportadora", já registrada no PRD).
+
+**Validado:** lógica testada offline com dado sintético no schema real confirmado — `_strip_code_
+prefix` limpou corretamente origem/destino (`"0003161628-FAZENDA BOM TEMPO"` → `"FAZENDA BOM
+TEMPO"`). `python -m py_compile` limpo. Testado ao vivo via `extract_ongo.py`/`run_ongo_once.py`
+(múltiplas rodadas 2026-07-08) — capturou dado real (4-14 linhas por ciclo) consistentemente.
+**Migration `ongo_descarregamentos_migration.sql` aplicada em produção em 2026-07-08** — tabela
+confirmada via SELECT direto (0 linhas, aguardando o próximo ciclo real gravar). Upsert deve
+funcionar limpo agora (a única falha anterior era "tabela não existe").
+
+**⚠️ Nota de risco (por que M32/M34 não foram testados ao vivo nesta rodada):** a exploração inicial
+(1 login) funcionou e trouxe os dois endpoints acima com sucesso. Uma segunda tentativa de sessão,
+logo em seguida, **falhou no login** (campo de usuário não apareceu a tempo) — sinal possível de
+fricção anti-bot por sessões consecutivas rápidas demais, exatamente o risco que a decisão de
+"manual/sob demanda" (acima) já antecipava. Por precaução, não insisti numa terceira tentativa.
+Validação ao vivo fica pro usuário rodar quando achar oportuno (`python extract_ongo.py`), não no
+cron automático das 23:55 ainda.
+
+### M35 — Score de Confiabilidade por CPF de Motorista
+**Fonte:** cadastro Autônomos (405 motoristas, CPF, nome, proprietário — hoje isolado do resto).
+**Escopo:** cruzar CPF com histórico de cancelamento/reagendamento (dado do M33) pra pontuar risco por
+indivíduo, não só agregado por transportadora. Depende do M33 já estar rodando (precisa do histórico
+de cancelamento pra cruzar).
+
+### M36 — Disparo Automático pro Motorista Parado
+**Fonte:** relatório "Aguardando Descarregamento" (nome, CPF, celular, placa, "Ticket em análise").
+**Escopo:** WhatsApp direto pro **celular do motorista** (não pro grupo interno — é um destinatário
+novo, fora do padrão de automação usado até aqui). **Ressalva de design:** mandar mensagem não
+solicitada pro número pessoal de terceiro tem implicação de consentimento/spam diferente de avisar o
+próprio grupo interno.
+**Decisão confirmada (2026-07-08):** construir o botão "Disparar Cobrança" no dashboard **sem função
+real por trás** (UI/placeholder) — fica visível mas inerte até o usuário decidir "ligar o fio" de
+acordo com o que cada cliente pedir. Não automatizar disparo sem supervisão nesta fase.
+
+### M37 — Auditar `LANCES_URL` morta
+Item de higiene técnica, não milestone de valor de negócio — `/lances` não responde pra este tipo de
+conta (redireciona pro Dashboard, achado já confirmado no código: `page.goto(LANCES_URL, ...)` em
+`extract_ongo.py:718`). Só confirmar se é código morto e remover, ou gatear por tipo de conta.
+
+### M38 — Robustez do Monitor Contínuo pra Produção 24/7 — planejado, não iniciado
+**Contexto (2026-07-08):** produção precisa do monitor contínuo (`extract_ongo.py::main()`, ciclo de
+5 em 5 min — **não** o cron único `run_ongo_once.py` das 23:55) rodando o dia inteiro, porque o Ongo
+é muito dinâmico. Isso muda o perfil de risco: não é mais "1 login por dia", é "1 login vivo por
+muitas horas seguidas, com o processo tendo que sobreviver e se recuperar sozinho".
+
+**⚡ Fixes de baixo risco já aplicados hoje (não esperam o milestone):**
+- **Alerta WhatsApp no monitor contínuo** — `main()` não tinha `alertar_falha()` em nenhum dos
+  `except` (só o `run_ongo_once.py` tinha); agora ambos os pontos de falha (re-login e erro geral de
+  varredura) alertam de verdade, mesma função já usada em todo o resto do projeto.
+- **Pausa de 20s antes do re-login automático** — antes, uma sessão expirada disparava re-login
+  *imediato*, o mesmo padrão (login logo após outro) que causou a fricção real observada em
+  2026-07-08 (2ª tentativa de exploração falhou). Não elimina o risco, só para de empilhar tentativas
+  rápidas sem necessidade.
+
+**🔜 Camadas maiores — desenhadas, aguardando decisão de implementação:**
+1. **Supervisão de processo (o gap mais sério hoje):** se o processo Python morrer por inteiro (não
+   uma exceção tratada, um crash duro do Chromium, o processo ser fechado, etc.), nada reinicia
+   sozinho. Duas opções:
+   - Windows Task Scheduler nativo — a própria tarefa agendada tem opção "reiniciar a cada X min se
+     falhar, até Y vezes" (config, não código).
+   - NSSM (Non-Sucking Service Manager) — roda como serviço Windows de verdade, reinicia sozinho,
+     sobrevive até sem usuário logado. Mais robusto, mais setup.
+2. **Reciclagem preventiva do browser/sessão** — hoje 1 browser fica vivo por horas/dias seguidos
+   (bom pra evitar logins repetidos, mas Chromium headless pode acumular memória em sessões muito
+   longas). Reiniciar browser+login a cada N horas (ex.: 6-12h) como manutenção programada, não só
+   reativamente quando já quebrou — também renova o token de sessão antes dele expirar sozinho.
+   **Cuidado:** isso em si gera um login novo a cada recycle, então precisa de um intervalo generoso
+   pra não recriar o problema que estamos tentando evitar.
+3. **Heartbeat externo** — uma checagem simples (ex.: "o `ongo_log.json` não foi atualizado há mais
+   de 15 min?") pra pegar o caso raro de tudo travar silenciosamente mesmo com as camadas acima.
+4. **Config de energia/rede da máquina local** — provavelmente a causa mais provável de interrupção
+   no dia a dia (mais que anti-bot): notebook dormir/hibernar ou perder Wi-Fi. Não é código, é
+   configuração do Windows (nunca dormir, sempre na tomada, Wi-Fi sem economia de energia) — mas é
+   pré-requisito real pra rodar 24/7 local.
+
+**Decisão registrada (2026-07-08):** não implementar as camadas 1-4 agora — documentar como
+milestone e decidir a ferramenta (Task Scheduler vs. NSSM) numa sessão dedicada antes de produção
+de verdade depender disso.
+
+### M39 — Dashboard Unificado do Ongo dentro da Torre ✅
+**Entregue:** 2026-07-08
+
+**Contexto — pivô de arquitetura:** a ideia original (2026-07-08, mais cedo) era Looker Studio
+conectado nas abas do Sheets pro dashboard do M32/M34. Usuário sentiu fricção real na UI de
+arrastar-e-soltar do Looker; cogitamos Metabase como alternativa (conecta direto no Postgres,
+UI mais simples). O usuário então trouxe a ideia vencedora: **em vez de ferramenta nova, estender o
+menu de abas que já existe** no `OngoGeralModal` (Ao Vivo/Histórico, desde o M21) com mais abas —
+zero ferramenta nova, zero página nova, reaproveita 100% da infraestrutura já validada.
+
+**Implementado:**
+- **Aba "Ao Vivo" redesenhada:** colunas mais compactas (`px-2 py-1.5` em vez de `px-3 py-2`,
+  headers encurtados — "Município Origem"→"Município" etc.) pra abrir espaço sem exigir mais scroll
+  horizontal do que já existia.
+- **Nova coluna "% Lote"** — `(quantidade_kg - saldo_restante_kg) / quantidade_kg * 100`, mesma
+  fórmula do "% Completado" que já existia só no Histórico, agora também na Ao Vivo. 100%
+  client-side, zero mudança de backend (os campos já vinham na `cargas_ongo`).
+- **Nova coluna "Entrada Ongo"** — resposta à pergunta do usuário ("tem a data que a oferta caiu no
+  Ongo?"): **sim, já existia** (`first_seen_cache`, usado desde o M9/M15 só pra coluna "Data Entrada
+  Ongo" do Histórico), só não estava exposta na Ao Vivo/Supabase. Adicionado:
+  - `extract_ongo.py::_upsert_cargas_ongo()` ganhou parâmetro `first_seen_cache`, grava
+    `data_entrada_ongo` (texto cru, formato `dd/mm/aaaa hh:mm`, mesmo do cache) em cada linha.
+  - Migration `backend/ongo_data_entrada_migration.sql` (`ALTER TABLE cargas_ongo ADD COLUMN
+    data_entrada_ongo TEXT`) — ⚠️ **registrada aqui como aplicada por engano, mas nunca rodou de
+    fato em produção** (achado M39.3, ver abaixo); coluna confirmada inexistente no banco em
+    2026-07-09.
+  - **Limitação conhecida:** ainda não existe "data de conclusão" (quando o lote terminou de
+    carregar) — só a de entrada. Daria pra cruzar "entrada 13h dia X, concluído mesmo dia" (exemplo
+    do usuário) só com a entrada + o `status` atual; rastrear o momento exato da conclusão exigiria
+    uma nova cache tipo `first_seen_cache` só que pra transição de status → "Concluída", não
+    implementado nesta rodada (escopo deliberadamente cortado, ver Backlog).
+- **Aba "Sem Localização" (M32) nova** — `backend/services/sheets_reader.py::listar_aba()` (função
+  genérica nova, lê qualquer aba pelo nome usando a 1ª linha como cabeçalho — não hardcoded feito o
+  `listar_historico`) + endpoint `GET /api/ongo-geral/sem-localizacao` (`ongo_historico.py`) + proxy
+  Next.js. Lê do Sheets (snapshot do último ciclo, mesmo dado que já existia).
+- **Aba "Descarregamentos" (M34) nova** — lê **direto do Supabase** (`ongo_descarregamentos`), não
+  do Sheets — é a fonte que de fato acumula histórico entre ciclos (Sheets é full-refresh, mostra só
+  o último ciclo). Novo `app/api/ongo-geral/descarregamentos/route.ts` (mesmo padrão REST cru já
+  usado em `/api/ongo-geral/route.ts`). Inclui resumo agregado por motorista (client-side,
+  `useMemo`) — % com foto, % desligou localização, clicável pra filtrar a tabela detalhada.
+
+**Validado ao vivo (Puppeteer, VPS real, 2026-07-08):**
+- 4 abas visíveis no menu: Ao Vivo / Histórico / Sem Localização / Descarregamentos.
+- Ao Vivo: `% Lote` calculando certo com dado real (42%, 96% em linhas reais); `Entrada Ongo` vazio
+  corretamente (nenhum ciclo rodou desde a migration — vai popular no próximo).
+- Sem Localização: dado real do teste de hoje (10:24), linhas com Data Captura/ID Frete/ID
+  Caminhão/Último Ping/Status Frete populadas.
+- Descarregamentos: estado vazio correto ("Sem dado ainda"/"Nenhum descarregamento registrado
+  ainda") — tabela só foi criada depois do último ciclo real, comportamento esperado, não é bug.
+
+**Validado:** `npx tsc --noEmit` e `npm run build` limpos (16 rotas, +2 novas:
+`/api/ongo-geral/sem-localizacao`, `/api/ongo-geral/descarregamentos`). `python -m py_compile` limpo
+em `sheets_reader.py`/`ongo_historico.py`/`extract_ongo.py`/`main.py`. Deploy feito na VPS, health
+check OK.
+
+### M39.1 — Bug crítico: `cargas_ongo` acumulava lotes "fantasma" pra sempre ✅
+**Entregue:** 2026-07-08 (achado pelo usuário, poucas horas após o M39 subir)
+
+**Sintoma:** usuário comparou a 1ª linha do Sheets com a 1ª linha da Torre — dado completamente
+diferente. Contagem também batia errado: Sheets com 128 linhas reais, Torre mostrando 248 "ofertas".
+
+**Causa raiz:** `_upsert_cargas_ongo()` sempre fez só `upsert` (insere/atualiza), **nunca `delete`** —
+um lote que sai da lista ativa do Ongo (carregado, cancelado, expirado) nunca foi removido da tabela
+`cargas_ongo`, ficando fantasma pra sempre. Diferente do Sheets, que já fazia full-refresh
+(`_write_ws` → `ws.clear()` a cada ciclo). Confirmado com dado real: dos 248 lotes na tabela, só 128
+tinham o timestamp do ciclo mais recente — os outros 120 eram de ciclos entre 02/07 e 07/07, já
+inativos.
+
+**Fix (`extract_ongo.py::_upsert_cargas_ongo`):** depois do upsert, `DELETE FROM cargas_ongo WHERE
+link_id_carga NOT IN (<ids do ciclo atual>)` — mesmo comportamento full-refresh que o Sheets já tem.
+**Limpeza imediata:** os 120 fantasmas existentes foram removidos direto via Supabase (sem precisar
+de novo ciclo do Ongo) — tabela confirmada em 128 linhas na hora.
+
+**Dois ajustes de UX pedidos junto (mesmo achado):**
+- Coluna **"Empresa" → "ID Ongo"** na aba Ao Vivo — o dashboard é de uma transportadora só
+  (Agrícola Alvorada sempre), então "Empresa" era sempre o mesmo valor, sem informação nenhuma;
+  `link_id_carga` é o dado útil ali.
+- **Alerta visual no "% Lote"** — saldo restante abaixo de um mínimo viável de carga (nenhum
+  caminhão real pega, ex.: 2.000 kg) agora aparece em **vermelho com ⚠**, em vez de parecer só "mais
+  um pouco pra completar". Limiar usado: **7.000 kg** (abaixo do menor caminhão comum, "Toco",
+  ~7-8t) — valor conservador, ajustável se o usuário quiser outro corte.
+
+**Validado ao vivo (Puppeteer, VPS real):** Total de Lotes = **128** (bate exato com o Sheets);
+Volume Liberado Total = **156.294.858 kg** (bate exato com a soma manual do usuário, 156.294,858);
+coluna "ID Ongo" mostrando IDs reais (329160, 329163); lote 329163 (50.000kg/2.000kg saldo) mostrando
+**"96% ⚠" em vermelho**, exatamente o exemplo dado pelo usuário.
+
+### M39.2 — Auditoria de tabelas espelho: mesmo bug no Trizy + arquivo errado editado ✅
+**Entregue:** 2026-07-08 (pedido do usuário: "Verifica outras tabelas espelho que podem ter o mesmo bug")
+
+**Achado 1 — `octamove_extracao_trizy` tinha o mesmo padrão do M39.1:** `upsert_smart()` só fazia
+insert/update, nunca removia BID que saiu da lista ativa do Trizy — inflava os KPIs de "Pendente" pra
+sempre. Fix **diferente** do Ongo aqui: BID carrega dado nosso (`status_crm`, `valor_proposto_ton`,
+`observacao_interna`), então em vez de `DELETE` a linha é marcada `status_crm = "PERDIDA"` com nota
+automática em `observacao_interna`, preservando histórico. BID já `GANHA`/`PERDIDA` não é tocado.
+
+**Achado 2 — existiam DUAS cópias de `trizy_extractor.py` no disco**, e as edições de hoje (hook
+M27.1 do Cérebro Central + o fix acima) foram feitas por engano na cópia errada:
+- `C:\Users\Dell\trizy_extractor.py` — rascunho **v2** abandonado (293 linhas, sem busca de detalhe,
+  sem auto-renovação de token). Não usado em produção — confirmado via Task Scheduler (nenhuma
+  tarefa agendada pra Trizy existe; extração roda manual/sob demanda).
+- `no-grain-os/scrapers/trizy/trizy_extractor.py` — script **v5 real** (595 linhas, data de
+  modificação 30/06 batendo exato com a entrega do M9), com busca de detalhe por negociação,
+  auto-renovação de token via Scrapling em caso de HTTP 401, todos os campos mapeados.
+
+Os dois fixes (hook M27.1 + marca-PERDIDA de fantasma) foram **reaplicados no arquivo v5 real**, que
+é quem de fato roda. O arquivo v2 na raiz foi marcado com aviso `[DEPRECATED]` no cabeçalho (não
+usar) mas não foi apagado — mantido só por segurança, sem confirmação do usuário para exclusão.
+`python -m py_compile` limpo no v5 corrigido.
+
+**Achado 3 — outras tabelas checadas, sem o mesmo bug:** `antt_coeficientes`, `toll_plazas`/
+`toll_rates` e `maplogis_cache` são dado de referência/cache genuíno (não espelho de uma lista ativa
+que encolhe), não precisam do mesmo tratamento. Nenhuma outra tabela com o padrão "upsert sem delete
+de um espelho de lista externa" foi encontrada.
+
+### M28.2b (parcial) — Link Trizy na calculadora + fix cidades duplicadas (Ongo) ✅
+**Entregue:** 2026-07-08
+
+**Cidades duplicadas — causa raiz:** filtro "Município Origem" da aba Ao Vivo (`OngoGeralModal`) usava
+`Array.from(new Set(rows.map(r => r.municipio_origem)))` sobre string crua — o cadastro do Ongo tem
+inconsistência de digitação na origem (`"QUERENCIA"` sem acento e `"QUERÊNCIA"` com acento no mesmo
+município), então viravam duas entradas no dropdown. Mesma classe de bug já resolvida pra cliente no
+M27.3 (`lib/cliente.ts`).
+
+**Fix:** extraída a lógica de normalização (`semAcento`/chave/heurística de melhor rótulo) do
+`lib/cliente.ts` para um util compartilhado `lib/normalizacaoTexto.ts`; criado `lib/municipio.ts`
+(`chaveMunicipio`, `construirMapaMunicipios`) reaproveitando o mesmo util. Aplicado no `useMemo` de
+`municipios` e no filtro `filtradas` do `OngoGeralModal`. `terminal_origem`/`empresa` têm a mesma
+exposição estrutural mas não foram tocados agora (não reportados) — candidatos a mesmo tratamento se
+o usuário confirmar duplicata neles também.
+
+**M28.2a — link Trizy na calculadora:** investigação confirmou que `negociacaoId` (identificador do
+BID individual) **não é persistido** em `octamove_extracao_trizy` — é descartado depois de buscar o
+detalhe, tanto no `scrapers/trizy/trizy_extractor.py` quanto no `scrapers/trizy-actor/`. E não há no
+código nenhuma URL de detalhe do BID confirmada (só a URL-base da lista, `bid.trizy.com.br/cotacao-
+frete`, usada de fato em navegação real no actor). Implementado o que é seguro sem inventar URL:
+botão "Abrir no Trizy" no header da calculadora (`torre/calcular/[id]/page.tsx`), visível só quando a
+cotação carregada veio do Trizy (`isTrizy`, setado no fallback de fetch pra `/api/trizy/cotacoes`),
+linkando pra lista real de BIDs. **Deep-link pro BID específico fica pendente** — precisaria (1)
+confirmar o padrão real da URL de detalhe inspecionando o app da Trizy no navegador, e (2) persistir
+`negociacaoId` como coluna nova em `octamove_extracao_trizy` nos dois scrapers.
+
+**Validado ao vivo (Puppeteer, VPS real):** dropdown de município com 32 opções, `"Querência"`
+aparecendo uma única vez (sem duplicata "QUERENCIA"). Botão "Abrir no Trizy" renderizado na
+calculadora carregada com BID real (`00067487`), `href` confirmado = `https://bid.trizy.com.br/
+cotacao-frete`. `npx tsc --noEmit` e `npm run build` limpos (16 rotas). Deploy feito, health check OK.
+
+### M39.3 — Bug crítico: migration `data_entrada_ongo` nunca foi aplicada, sync do dia inteiro travado ✅
+**Entregue:** 2026-07-09 (achado pelo usuário: "sheets 132 ofertas ... ao vivo 128 ofertas")
+
+**Sintoma:** usuário comparou contagem do Sheets (132 ofertas, atualização 08/07 23:55) com a aba Ao
+Vivo da Torre (128 ofertas) e notou divergência — mesmo padrão de sintoma do M39.1, mas causa raiz
+diferente desta vez.
+
+**Causa raiz:** a migration `backend/ongo_data_entrada_migration.sql` (`ALTER TABLE cargas_ongo ADD
+COLUMN data_entrada_ongo TEXT`), registrada no M39 como "aplicada em produção pelo usuário", **nunca
+rodou de fato** — confirmado com `SELECT data_entrada_ongo FROM cargas_ongo` retornando erro real de
+schema do Postgres (`42703 column ... does not exist`, não um erro de cache do PostgREST, que seria
+`PGRST204` — a distinção importa: `42703` prova que a coluna não existe na tabela de verdade).
+Como `_upsert_cargas_ongo()` desde o M39 sempre inclui `data_entrada_ongo` no payload, **todo upsert
+desde então vinha falhando** — confirmado no `ongo_cron.log` de 08/07 23:56: `ERRO ao sincronizar
+cargas_ongo no Supabase: {'message': "Could not find the 'data_entrada_ongo' column...", 'code':
+'PGRST204'}`. A falha era só logada (try/except interno em `_upsert_cargas_ongo`, silencioso por
+design pra não derrubar o ciclo do Sheets — comentário original: "Nunca deve derrubar o ciclo do
+Sheets"), sem alerta WhatsApp, então passou despercebida: Sheets seguiu perfeito (132, fresco),
+`cargas_ongo`/Torre ficou parada na última sincronização bem-sucedida antes do bug (128 linhas,
+timestamp único `2026-07-08T14:25:42`, de uma sincronização manual anterior nesta mesma sessão).
+
+**Fix:**
+1. Migration reconfirmada correta (não precisou reescrever) — **entregue ao usuário pra rodar de
+   verdade desta vez** no SQL Editor do Supabase.
+2. `extract_ongo.py::_upsert_cargas_ongo()` — adicionado `alertar_falha()` no `except` que já existia,
+   pra esse tipo de falha silenciosa nunca mais passar 1 dia inteiro sem ninguém perceber (mesmo
+   padrão do M38, só que faltava aqui especificamente).
+
+**Sem novo login necessário:** a migration não mexe no scraper/Ongo — só schema do Supabase. Depois
+de aplicada, o próprio cron diário das 23:55 (`run_ongo_diario.bat` → `run_ongo_once.py`) resincroniza
+sozinho na próxima execução, sem precisar rodar nada manual agora.
+
+---
+
 ## PRÓXIMOS MILESTONES (Backlog)
 
 | # | Milestone | Descrição | Prioridade |
 |---|-----------|-----------|------------|
-| M18.1 | Ongo — Alerta "Sem Localização" | Ler o indicador nativo do Dashboard (motorista "Em Rota" sem ping GPS) e disparar WhatsApp via Evolution API quando ultrapassar X horas. Ver PRD 9.2 | Alta |
-| M18.2 | Ongo — Extrator "Fretes Cancelados" + "Troca de Nota" | Novas abas não cobertas hoje: cruzar cancelamento de frete (~18%/semana) com cancelamento de troca de CT-e (~35%/semana) num diagnóstico único pra abertura comercial. Ver PRD 9.2 | Alta |
-| M18.3 | Ongo — Score de Compliance de Descarga | Capturar campo "Desligou a câmera" + score de completude (X/4) da aba Descarregamentos, agregando por motorista/transportadora. Ver PRD 9.2 | Média |
-| M18.4 | Ongo — Score de Confiabilidade por CPF de motorista | Cruzar cadastro de Autônomos (405 motoristas, CPF) com histórico de cancelamento/reagendamento — hoje o score só existe agregado por transportadora. Ver PRD 9.2 | Média |
-| M18.5 | Ongo — Disparo automático pro motorista parado | Usar dados de "Aguardando Descarregamento" (nome/CPF/celular/placa) pra automação de WhatsApp cobrando status, sem ligação manual do comercial. Ver PRD 9.2 | Média |
-| M18.6 | Ongo — Auditar `LANCES_URL` morta no extrator | `/lances` não existe/não é acessível pra conta transportadora atual (redireciona pro Dashboard) — confirmar se é código morto antes de continuar confiando nela. Ver PRD 9.2 | Baixa |
-| M10 | Trizy FASE 2 — POST Lance | Botão "Fazer Oferta" na calculadora: `POST /bid/transportadora/cotacao-frete/{negociacaoId}/lance` | Alta |
-| M10 | Trizy — Token auto-renovação Task Scheduler | Agendar `trizy_login.py` diário para manter sessão ativa | Alta |
-| M10 | Trizy — Alerta WhatsApp | Enviar mensagem via Evolution API quando novo BID chega com produto/rota de interesse | Alta |
-| M11 | Trizy — CRM N8N | Workflow N8N que lê `status_crm` e dispara ações (resposta, acompanhamento) | Média |
+| ~~—~~ | ~~Rodar `ongo_data_entrada_migration.sql` de verdade~~ | ✅ Resolvido em 2026-07-09 — migration aplicada de fato no SQL Editor do Supabase (coluna `data_entrada_ongo` confirmada via REST API), ciclo manual (`run_ongo_once.py`) rodado em seguida pra resincronizar (139 lotes, sem erro `PGRST204`), e conferido ao vivo no navegador: aba Ao Vivo da Torre bateu com Sheets (139 registros) | — |
+| — | RAG + regras fiscais — em espera | Usuário vai pesquisar fontes de incidência fiscal e exemplos de RAG que erraram, antes de eu refinar `fiscal_service.py`/RAG. Não iniciar sem os exemplos. | Em espera (usuário) |
+| M31.2 | Exportar CSV — Efetividade Comercial | Botão na aba `/torre/efetividade` pra baixar a tabela por cliente (período selecionado) em CSV — pedido do usuário 2026-07-08, registrado pra implementação futura | Média |
+| M38 | Robustez do Monitor Contínuo (produção 24/7) | Supervisão de processo (Task Scheduler restart vs. NSSM), reciclagem preventiva de sessão, heartbeat externo, config de energia da máquina — necessário antes de depender do monitor de 5 em 5 min em produção real. Ver FASE 10 acima pro detalhe | **Alta (antes de produção real)** |
+| ~~M39~~ | ~~Dashboard Unificado do Ongo (abas na Torre)~~ | ✅ Resolvido em 2026-07-08 — ver FASE 10 acima | — |
+| — | Data de Conclusão do lote (Ongo) | Hoje só existe "Data Entrada" (M39). Rastrear quando o lote termina de carregar (1ª vez que `status` vira "Concluída") exigiria uma cache nova tipo `first_seen_cache`, mesma lógica. Habilitaria a análise completa que o usuário pediu ("entrou 13h dia X, concluiu mesmo dia") | Média |
+| ~~—~~ | ~~Threading restante (M26)~~ | ✅ Resolvido em 2026-07-07 — `whatsapp_timeline.py`/`rag_service.py` corrigidos; `sheets_service.py` era código morto (não chamado), não precisou de fix | — |
+| — | Parser "Embarque Liberado" | Agora com amostra real (M24): `"Liberação de embarque Faz Sol vermelho ID 85748 Ongo- fazer confirmações"` | Média |
+| ~~M27.2~~ | ~~Contar Trizy nos KPIs de pendência~~ | ✅ Resolvido no M27 (2026-07-07) — ver FASE 8 | — |
+| ~~M28.1~~ | ~~Botão "Sugerir Preço" (RAG)~~ | ✅ Resolvido no M28 (2026-07-07) — ver FASE 8 | — |
+| ~~M27.3~~ | ~~Normalizar nome de cliente no filtro~~ | ✅ Resolvido no M27 (2026-07-07) — ver FASE 8 | — |
+| ~~—~~ | ~~Aplicar `torre_memoria_global_migration.sql`~~ | ✅ Aplicada em produção 2026-07-07 (2 partes, ver Addendum M27) + backfill do histórico (352/368 fragmentos) | — |
+| ~~M28.2a~~ | ~~Trizy — link direto do BID na calculadora~~ | ✅ Resolvido parcialmente em 2026-07-08 (botão pra lista do Trizy) — ver FASE 10, M28.2b (parcial) | — |
+| — | Trizy — deep-link pro BID específico | Precisa (1) confirmar padrão real da URL de detalhe no app da Trizy e (2) persistir `negociacaoId` como coluna nova em `octamove_extracao_trizy` (hoje descartado nos dois scrapers) | Média |
+| M28.2b | Gmail — rascunho de e-mail via API | **Bloqueado** — precisa escopo `gmail.send` (hoje só `gmail.readonly`); exige o usuário reautorizar OAuth manualmente no navegador | Alta (bloqueado) |
+| M28.2c | WhatsApp — payload + disparo Evolution API | Precisa campo novo `remote_jid` em `painel_fretes` (hoje só o grupo é salvo, não a thread exata) | Alta |
+| — | Legado ruidoso em `historico_fechamentos` | 286 linhas do Ongo (04/07 e 06/07) ainda com origem/destino em formato de código de fazenda — fix (2026-07-07) só vale pra daqui pra frente; diluem-se naturalmente conforme dado novo (já limpo) se acumula | Baixa |
+| ~~M29.1~~ | ~~Reprecificação Semântica (Market Shift)~~ | ✅ Resolvido no M29 (2026-07-07) — ver FASE 8 | — |
+| ~~M29.2~~ | ~~Gatilho de Auto-Loss~~ | ✅ Resolvido no M29 (2026-07-07) — ver FASE 8 | — |
+| ~~M29.3~~ | ~~Despertador Matinal (WhatsApp Digest)~~ | ✅ Confirmado 2026-07-08 — usuário recebeu a mensagem real no grupo, formato correto (7 cotações, R$570k em risco) | — |
+| M32-M37 | Ongo — Valor pra Transportadora | Ver FASE 10 acima (Alerta Sem Localização, Fretes Cancelados+Troca de Nota, Score Compliance, Score CPF motorista, disparo motorista, limpar LANCES_URL morta) — escopo técnico completo já desenhado, não iniciado | Alta→Baixa (ver ordem na FASE 10) |
+| M10 | Trizy FASE 2 — POST Lance | **Stand-by (decisão 2026-07-08)** — login usado hoje (`Nova Frota Transportes`) não é cliente pagante nosso; não faz sentido operar lances reais numa conta de terceiro. Retomar quando houver cliente pagante que queira essa função. Botão "Fazer Oferta" na calculadora: `POST /bid/transportadora/cotacao-frete/{negociacaoId}/lance` | Stand-by |
+| M10 | Trizy — Token auto-renovação Task Scheduler | Agendar `trizy_login.py` diário para manter sessão ativa | Média |
+| M10 | Trizy — Alerta WhatsApp novo BID | Enviar mensagem via Evolution API quando novo BID chega com produto/rota de interesse — velocidade de reação em leilão | Alta |
+| M11 | Trizy — CRM N8N | Rebaixado (2026-07-08) — automação nativa via cron (M29.2/M29.3) já cobre o mesmo valor sem depender de ferramenta externa. Reconsiderar só se surgir caso de uso que N8N resolva e a Torre não | Baixa |
 | — | Ongo Aba Aderência | Implementar aba "Aderência Transportadoras" (check-in/reagendamento/score por transportadora) no `extract_ongo.py` — ver M15 | Média |
 | — | Ongo Task Scheduler na VPS | Hoje roda local no Windows do usuário; migrar pra cron na VPS tornaria o fechamento 23:55 independente do notebook estar ligado | Média |
 | — | Adicionar grupos de frete reais | Incluir grupos como "Fretes MT", "APCAM FRETES", "Fretes Rondonópolis" no `GRUPOS_PERMITIDOS` | Média |
-| — | Popular `historico_fechamentos` | Importar fechamentos históricos reais para ativar RAG com dados reais | Média |
+| ~~—~~ | ~~Popular `historico_fechamentos`~~ | ✅ RAG ativo com dado real — 408 linhas (288 legado + 120 novas já limpas em 07/07), crescendo diariamente via cron 23:55 | — |
 | — | Notificações push | Alerta sonoro/visual quando nova cotação chega na Torre | Baixa |
-| — | CRM por embarcador | Histórico de cotações, taxa de ganho, ticket médio por cliente | Baixa |
+| ~~—~~ | ~~CRM por embarcador~~ | ✅ Resolvido — virou o Painel de Efetividade Comercial (M31), promovido pra aba própria em 08/07 (M31.1) | — |
 
 ---
 
@@ -741,3 +1540,10 @@ IP de datacenter, decisão já registrada) — mitigação local: retry + alerta
 | Calculadora dava 800+km em rotas curtas | Premissa errada de que "QualP só geocodifica Cidade/UF" — código descartava nome do local (fazenda/terminal) antes de mandar pro QualP, que geocodificava a sede do município ao invés do ponto real | M17: mandar `"Nome do Local, Cidade/UF"` ou lat/lng; QualP geocodifica endereço completo normalmente (testado manualmente: 348km vs 800+km) |
 | Link "Ver ponto exato no Maps" da Trizy não tem coordenada | `localizacao_origem_link` é uma URL de **busca** (`/maps/search/{texto}`), não um pin — não confundir com link de Gmail/WhatsApp que pode ter `/@lat,lng` ou `!3d!4d` | Usar o texto cru (`local_coleta_full`/`entidade_origem_trizy`) direto, sem tentar parsear coordenada desse link específico |
 | GPT-4o-mini `nivel_confianca` não-determinístico | Temperatura do modelo | Não usar `nivel_confianca` como gate de cotação |
+| Gate `origem/destino != "Não Especificado"` deixa passar cotação fantasma | GPT às vezes devolve `""` (vazio) em vez do sentinela `"Não Especificado"` | Testar `not in ("", "Não Especificado")`, não só `!=` — corrigido no M24 em `webhook_evolution.py` e `gmail_service.py` |
+| Status muda no banco mas não aparece na Torre / clique parece "não fazer nada" | Chamada síncrona bloqueante (Supabase/Sheets/Gmail API) rodando dentro de handler ou job `async` trava o event loop inteiro do FastAPI — qualquer requisição concorrente (inclusive o próprio clique) fica parada até a chamada bloqueante terminar | `asyncio.to_thread()` em toda chamada síncrona dentro de função `async` (ver M26); UI do status também virou otimista como segunda camada de defesa |
+| `octamove_extracao_trizy` não tem coluna de "última mudança de status" | Tabela só tem `criado_em` (data de ingestão) — nunca foi adicionado um `status_atualizado_em` equivalente ao de `painel_fretes` | M27.5 usa `criado_em` como proxy para "dias parado" no alerta tático — impreciso para BIDs antigos com mudança de status recente; considerar adicionar a coluna se o alerta gerar falso-positivo em produção |
+| Hooks de `torre_memoria_global` (M27.1) falhavam silenciosamente | Tabela só existe depois de rodar a migration no Supabase — enquanto não aplicada, `indexar_memoria()`/`indexar_memoria_sync()` logavam erro e retornavam `False`, sem derrubar a ingestão (best-effort por design) | ✅ Resolvido — migration aplicada e M27.1 validado ao vivo em 2026-07-07 (ver M27 acima) |
+| `CREATE INDEX ... USING ivfflat (embedding vector_cosine_ops)` truncado no copy-paste do SQL Editor web (`operator class "vector_c" does not exist`) | Mesma classe de armadilha já vista com caracteres decorativos (ver linha de `syntax error at or near "CREATE"` acima) — o editor web do Supabase corrompe/trunca texto colado em certas condições | Rodar a migration em arquivos `.sql` separados e pequenos (um por statement crítico), nunca como um único bloco grande colado junto com texto explicativo; se falhar, isolar a linha problemática num arquivo próprio e rodar sozinha |
+| `upsert` sem `delete` acumula lote "fantasma" pra sempre (achado M39.1, 2026-07-08) | Qualquer sync que só faz `upsert(on_conflict=...)` sem remover linhas que saíram da fonte original vai divergir com o tempo — `cargas_ongo` chegou a ter 248 linhas quando só 128 eram reais (120 fantasmas desde 02/07) | Todo sync tipo "espelho de uma lista externa que muda" precisa de um passo de limpeza (`DELETE WHERE id NOT IN (<ids do ciclo atual>)`) depois do upsert — não só `octamove_extracao_trizy`/`cargas_ongo`, checar se o mesmo padrão existe em outras tabelas espelho antes de confiar cegamente |
+| Cópia duplicada de script local editada por engano (achado M39.2, 2026-07-08) | `C:\Users\Dell\trizy_extractor.py` (v2, rascunho abandonado) e `no-grain-os/scrapers/trizy/trizy_extractor.py` (v5, real) coexistiam no disco com o mesmo nome de função (`upsert_smart`) — sem Task Scheduler pra desambiguar (Trizy roda manual), editei a v2 por várias mudanças (M27.1 + fix fantasma) sem perceber que não era a usada em produção | Antes de editar qualquer script local em `C:\Users\Dell\*.py`, confirmar que não existe outra cópia com `grep -rn "def <funcao_chave>" /c/Users/Dell --include="*.py"` — checar docstring de versão e data de modificação; arquivo v2 foi marcado `[DEPRECATED]` no cabeçalho, não apagado |
