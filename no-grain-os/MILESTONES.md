@@ -1,7 +1,7 @@
 # NO GRAIN OS — Milestones
 
-**Última atualização:** 2026-07-07  
-**Versão:** 3.5  
+**Última atualização:** 2026-07-16  
+**Versão:** 4.4  
 **Ambiente:** VPS `2.24.201.246` | Backend :8000 | Frontend :3000
 
 ---
@@ -1490,6 +1490,631 @@ sozinho na próxima execução, sem precisar rodar nada manual agora.
 
 ---
 
+## Achados fora do escopo original (2026-07-15/16) — não eram milestone planejado, viraram trabalho real
+
+Sessão de 2 dias começou testando o M54 e destravou uma sequência de problemas de infraestrutura
+que não estavam em nenhum roadmap — registrados aqui separado dos milestones porque não têm número
+de M, mas foram trabalho real com impacto direto em produção. Detalhe técnico completo de cada um
+em PRD.md § Armadilhas Conhecidas.
+
+1. **Vazamento de memória no backend (2026-07-15):** processo ia de ~90MB a 1GB+ em horas, Torre
+   ficava lenta até travar. Causa: `create_client()` novo a cada requisição em 8 arquivos.
+   Corrigido com cliente Supabase singleton (`services/supabase_client.py`) + PM2
+   `--max-memory-restart 500M` como rede de segurança.
+2. **Divergência de dado Liberações x Ongo Geral (2026-07-15):** 167 vs 101 "ofertas" — 66 cargas
+   encerradas no Ongo ficavam presas como "liberado" pra sempre. Corrigido com reconciliação em
+   `extract_ongo.py` (M41) + backfill dos 66 registros travados.
+3. **Permissão do Google Sheets (2026-07-15):** token só tinha escopo de leitura; ao tentar dar
+   escopo de escrita pro M52, descoberto que a conta usada (`octamoveai@gmail.com`) não é a dona
+   da planilha (é `edastorga0@gmail.com`). Resolvido via conta de serviço do próprio Ongo
+   concedendo acesso — sem precisar de mais nenhuma ação manual do usuário.
+4. **Instância WhatsApp sobrecarregada (2026-07-16):** bot rodava no número pessoal do usuário
+   (anos de histórico, dezenas de grupos) — Baileys precisa sincronizar a conta inteira, gerando
+   200%+ CPU / 2,5GB+ RAM e quebrando todo envio (`SessionError: No sessions`, tanto DM quanto
+   grupo). Corrigido migrando pra número dedicado sem histórico (instância `octamove` → `KM`,
+   `556692207154`) — CPU caiu pra 2,7%, RAM pra ~100MB.
+5. **Link do M54 raso demais (2026-07-16):** validando o fluxo real, usuário notou que o link
+   público só tinha 5 campos — insuficiente pra filial cotar. Enriquecido com ponto de coleta/
+   entrega, veículo, cadência, prazo, KM, pedágio, piso ANTT e Maps, mantendo o link escopado
+   (decisão: não abrir o sistema interno, só enriquecer o link público).
+
+**Pendência aberta, sem prioridade definida:** domínio + HTTPS pra VPS (hoje `http://IP:porta`,
+por isso o magic link do M54 não fica clicável no WhatsApp — funciona, só não é 1-toque). Usuário
+confirmou que vai providenciar um domínio, mas não é urgente.
+
+---
+
+## FASE 11 — Módulo Liberações & Aderência (Torre) — em andamento (2026-07-10, itens "baratos" concluídos 2026-07-15; M44 em stand-by)
+
+**Origem:** conversa dedicada de BPM/processo (2026-07-10) a partir da pasta `Rag de Liberações/`
+(prints reais de grupo BTG/Agrícola Alvorada, portal SMC BTG Pactual, Cadência Diária da Nova Frota,
+Planilha de Clientes Geral) — ver [[project_torre_liberacoes]]. Objetivo de produto: eliminar o
+planejamento manual e pulverizado de liberações de frete (WhatsApp, e-mail, portal externo) sem
+tirar o humano do loop nos pontos de risco, e gerar memória de preço/execução histórica (RAG) a
+partir do ciclo de vida de cada lote.
+
+**Decisões de arquitetura que valem para todas as sub-milestones:**
+- **Fonte única de verdade:** todo dado consolidado vive no Supabase. Qualquer Sheets é projeção
+  gerada, nunca é editado por fora (mesmo princípio já usado no projeto — Sheets do Ongo é espelho
+  de leitura, não fonte).
+- **Humano no loop por exceção, não por regra:** automação aplica direto quando a confiança é alta
+  ou duas fontes concordam (ex.: portal + WhatsApp); confiança baixa ou fontes divergindo cai numa
+  fila de revisão humana (mesmo padrão do `[Tratado]` já usado no Radar WhatsApp).
+- **Portal manda quando conflita com WhatsApp:** portal (Ongo/BTG SMC) é fonte estruturada; o grupo
+  de WhatsApp é o gatilho + o motivo/contexto (reajuste, suspensão, urgência) que o portal não
+  registra como texto livre.
+- **Estado atual separado de histórico:** `liberacoes_ativas` (o que está aberto agora) é uma coisa;
+  `execucoes_lote` (o que aconteceu do início ao fim de um lote já fechado) é outra — mesmo princípio
+  que já existe no Ongo (aba "Ao Vivo" vs. aba "Histórico").
+- **Toda liberação/reajuste é também documento comprobatório**, não só dado — o e-mail/print/PDF
+  original precisa ser guardado (hoje descartado depois da extração Vision no `webhook_evolution.py`),
+  ligado ao lote, nomeado automaticamente — nunca por digitação manual.
+
+### M40 — Schema base de Liberações ✅ concluído (2026-07-10)
+**Escopo:** tabelas `liberacoes_eventos` (staging bruto por fonte, com tipo de evento e confiança de
+extração) e `liberacoes_ativas` (estado atual consolidado por cliente/filial/lote). Sem UI, sem fonte
+nova ainda — é a fundação onde tudo abaixo se pluga.
+
+**Entregue:** `backend/liberacoes_migration.sql` aplicada no Supabase SQL Editor. Precisou ser rodada
+em blocos separados (um `CREATE` por vez) — o paste multi-statement corrompia de forma intermitente
+mesmo em ASCII puro (`syntax error at or near "CREATE"` na linha seguinte a um `CREATE INDEX`),
+variante nova da armadilha conhecida do editor web. Ambas as tabelas confirmadas via REST
+(`GET .../rest/v1/liberacoes_ativas` → 200).
+
+### M41 — Ongo → `liberacoes_ativas` ✅ concluído (2026-07-10)
+**Escopo:** primeira fonte real alimentando o M40. Não é captura nova — Ongo já flui via
+`extract_ongo.py`/`cargas_ongo` — é remapeamento para o schema consolidado.
+
+**Entregue:** `_upsert_liberacoes_ativas()` adicionada em `extract_ongo.py`, chamada junto com
+`_upsert_cargas_ongo()` no mesmo ciclo, reaproveitando os mesmos `fretes`/`valor_cache` já buscados
+(zero requisição extra ao Ongo). Mapeia `STATUS_CARGA` (0/1/2/3) para o enum novo
+(`liberado`/`zerado`/`cancelado`). **Validado ao vivo** via `run_ongo_once.py`: 116 linhas
+sincronizadas em `liberacoes_ativas`, dados conferidos (cliente/origem/destino/volume/status).
+
+**Bug encontrado e corrigido (2026-07-15) — divergência 167 vs. 101:** o upsert só tocava cargas
+que ainda apareciam no pull atual do Ongo — quem sumia de lá (concluído/cancelado do lado do Ongo)
+ficava travado como `liberado` pra sempre em `liberacoes_ativas`, nunca refletindo o encerramento.
+Achado comparando `/torre/liberacoes` (167 "ofertas") com o card Frete Geral Ongo (101) — 66
+registros órfãos, parados desde 10-13/07 (confirmado por `atualizado_em` nunca mais tocado).
+Corrigido com uma reconciliação no fim de `_upsert_liberacoes_ativas()`: depois do upsert, compara
+quem estava `liberado` com quem veio no pull atual e marca como `zerado` (semáforo já tratava esse
+status como "Finalizado", cinza — não precisou mexer no frontend) quem sumiu. Os 66 órfãos
+existentes corrigidos direto via Supabase REST no mesmo dia, sem esperar o próximo ciclo do
+scraper.
+
+### M42 — Tela `/torre/liberacoes` + FonteCard ✅ concluído (2026-07-10)
+Consolidação visual: tabela com semáforo, filtros filial/regional/cliente/destino, alternância
+"minha carteira x visão geral". Testado ao vivo no navegador contra os 116 lotes reais do M41.
+
+**Entregue:** `app/torre/liberacoes/page.tsx` (nova tela), `app/api/torre/liberacoes/route.ts` (lê
+`liberacoes_ativas` direto do Supabase, mesmo padrão do `ongo-geral/route.ts`), `lib/liberacao.ts`
+(heurística de semáforo — verde/amarelo/vermelho/cinza por saldo restante + estagnação, já que a
+lógica exata do Cadência Diária da Nova Frota está só em PDF que este ambiente não consegue renderizar
+sem `poppler-utils`; documentado como heurística de primeira versão a refinar), tipo `LiberacaoAtiva`
+em `types/carga.ts`, botão de navegação em `app/page.tsx`. "Minha Carteira" filtra por
+`responsavel_comercial` (guardado em `localStorage`, sem sistema de login) — hoje sempre vazio porque
+só o Ongo alimenta a tabela e não popula esse campo; mostra aviso explicando isso em vez de ficar
+silenciosamente vazio. Achado real no teste: 30 dos 116 lotes têm saldo zerado/negativo (`-35t` em
+um caso) sem status `zerado` — corretamente sinalizados em vermelho como "pendente fechamento",
+sinal de que o M43 (matcher) vai precisar lidar com essa divergência.
+
+### M43 — Matcher por ID + fila de revisão humana ✅ concluído (2026-07-10)
+Cruza evento novo (`liberacoes_eventos`, de qualquer fonte) com registro existente por ID; aplica
+delta se confiança alta, cai numa fila de revisão (Confirmar/Corrigir/Descartar, mesmo padrão do
+`[Tratado]`) se não. Peça central — toda fonte nova (M44/M45/M51) depende disso existir primeiro.
+
+**Entregue:** `backend/m43_matcher_migration.sql` (colunas `observacao` em `liberacoes_ativas`,
+`liberacao_ativa_id`+`motivo_pendencia` em `liberacoes_eventos`, aplicada pelo usuário no SQL
+Editor). `backend/services/liberacoes_matcher_service.py` — matching por ID direto (mesma
+fonte+id_externo) e cruzado (identificador_origem de um evento batendo com id_externo de qualquer
+fonte — o caso real do processo: WhatsApp cita o ID do Ongo). Confiança alta + candidato único →
+aplica direto; `liberacao_nova` sem candidato + confiança alta → cria lote novo; qualquer outro caso
+(confiança baixa/média, zero ou múltiplos candidatos) → fila de revisão. `backend/routers/liberacoes.py`
+expõe `/api/liberacoes/fila-revisao`, `/processar`, `/eventos/{id}/confirmar|corrigir|descartar`
+(mesmo padrão `asyncio.to_thread` do `whatsapp_timeline.py`, evita travar o event loop). Frontend:
+seção "Fila de Revisão" em `/torre/liberacoes` com os 3 botões, proxeada via
+`app/api/torre/liberacoes/{fila,processar,eventos/[id]/*}`.
+
+**Testado ponta a ponta** (sem produtor real de eventos ainda — M44/M45/M51 não implementados):
+3 eventos sintéticos inseridos direto no Supabase cobrindo os 3 caminhos — reajuste alta confiança
+com match cruzado (aplicou sozinho, R$46→52/ton), suspensão confiança média (caiu na fila, confirmada
+manualmente no navegador via Puppeteer, virou `Suspenso`), liberação nova alta confiança sem match
+(criou lote novo). Os 3 resultados batem (`processados:3, aplicado:1, criado:1, pendente:1`). Dados
+sintéticos e os 2 lotes reais alterados no teste foram revertidos/removidos ao final.
+
+**Deploy VPS (2026-07-14):** M40-M43 estavam rodando só local desde 2026-07-10 (usuário auditando
+manualmente antes de decidir subir). Após a auditoria de 14/07 fechar o desenho de M45-M53, decidido
+subir — nada ficou pra validar localmente. `deploy_vps.py` rodado, health check OK, confirmado ao
+vivo: `GET http://2.24.201.246:8000/api/liberacoes/fila-revisao` → 200 e
+`http://2.24.201.246:3000/torre/liberacoes` → 200 em produção.
+
+### M44 — Redefinido: Input manual de aderência (era "Scraper BTG SMC") ✅ concluído (2026-07-20)
+**Decisão do usuário (2026-07-20):** scraper do Portal SMC BTG Pactual fica em **stand-by** —
+trabalhar com as fontes já existentes em vez de esperar viabilidade de login/anti-bot do portal
+novo. Escopo original (login + raspagem de "Lista de Ordens de Frete") preservado como referência
+pra quando o stand-by for levantado — os 2 prints do portal (`Rag de Liberações/Portal Smc BTG
+Pactual.pdf` + `Abertura de Oferta...pdf`) já mapeiam as colunas certas (Qtd. programada → cadência,
+Qtd. carregada/em trânsito → aderência) pra quando isso for retomado.
+
+**O que foi entregue no lugar:** a mesma fonte humana que já existia na Nova Frota (filial reporta
+2-3x/dia, comercial digita na planilha) — só que digitando direto em `liberacoes_ativas` via Torre,
+não numa aba solta. Usa as 3 colunas que o M47 já tinha criado no schema (aplicadas em 14/07, sem
+produtor até agora):
+
+- `backend/services/liberacoes_matcher_service.py` — `atualizar_aderencia_sync()`, atualiza
+  subconjunto de `{cadencia_diaria, caminhoes_no_local, caminhoes_em_transito, frete_motorista_ton}`
+  campo a campo (permite salvar 1 input por vez, sem reenviar a linha inteira).
+- `backend/routers/liberacoes.py` — `PATCH /api/liberacoes/{id}/aderencia`.
+- `frontend-torre/app/api/torre/liberacoes/[id]/aderencia/route.ts` — proxy Next.js, mesmo padrão
+  dos outros endpoints de Liberações.
+- `frontend-torre/app/torre/liberacoes/page.tsx` — 5 colunas novas na tabela (Cadência, No Local,
+  Trânsito, % AD. calculado, Frete Motorista com margem exibida inline: `valor_tonelada -
+  frete_motorista_ton`), inputs inline com salvamento no blur, update otimista com reversão + toast
+  de erro em caso de falha (a tela não tinha nenhum feedback de falha antes — corrige de brinde o
+  achado #10 do raio-x de 17/07 nesta tela específica).
+- `frontend-torre/types/carga.ts` — `LiberacaoAtiva` ganhou os 3 campos.
+
+**Fix de brinde — link "Sincronizar Planilha" agora aponta pra aba certa:** `sincronizar_liberacoes()`
+retornava só a URL raiz do arquivo (sem `#gid=`), abrindo na última aba visitada — de onde vinha a
+sensação de "é a mesma planilha do Ongo" (é aba diferente no mesmo arquivo, mas o link não provava
+isso). Agora captura o `sheetId` da aba "Liberações Ativas" e devolve o link com `#gid=` certo. A
+projeção Sheets também ganhou as 5 colunas novas de aderência + margem (senão o dado digitado na
+Torre não apareceria na planilha exportada).
+
+**Validado ao vivo (2026-07-20, navegador real + Supabase real, não só typecheck/build):** backend e
+frontend subidos localmente, testado em `/torre/liberacoes` via Puppeteer contra o lote real
+`ongo#329516` (217 lotes reais na tela). Preencheu Cadência/No Local/Trânsito/Frete Motorista, PATCH
+retornou 200, valor confirmado persistido via nova leitura do Supabase (não só otimismo do frontend),
+UI recalculou `% AD.` (53%, âmbar) e margem (`marg. R$ 20,00`, verde) corretamente. Dado de teste
+revertido ao estado original ao final (`—`/0/0/`—`), confirmado limpo.
+
+**Bug real achado e corrigido durante a validação:** limpar um campo de volta pra vazio (ex.: apagar
+uma cadência digitada errada) devolvia 200 OK mas **não limpava nada** — `routers/liberacoes.py`
+usava `dados.model_dump(exclude_none=True)`, que descarta um `{"campo": null}` explícito do mesmo
+jeito que descartaria um campo nunca enviado. Trocado pra `exclude_unset=True`, que distingue "campo
+não mandado" (ignorar) de "campo mandado como null" (limpar de verdade). Retestado ao vivo depois do
+fix — `cadencia_diaria`/`frete_motorista_ton` voltam a `null` corretamente agora. Sem esse teste ao
+vivo (os testes automatizados de QualP/ANTT/Auto-Loss não cobrem esse endpoint), esse bug ficaria
+invisível até alguém tentar apagar um valor errado em produção e a Torre silenciosamente ignorar.
+
+**Desbloqueia:** M47 (schema pronto desde 14/07, agora tem produtor de dado — falta só decidir se
+"contagem híbrida"/trust ladder ainda faz sentido sem o scraper, ou se o input manual já é o
+suficiente por ora) → M48 (card de aderência automático, reaproveitando o padrão "Copiar Dados
+Brutos") → M49 (envio pra filial) → M50 (histórico + RAG).
+
+**Fix de brinde #2 (2026-07-20) — "Total de Lotes" (219) não batia com Verde+Amarelo+Vermelho (99):**
+achado do usuário parecia à primeira vista o mesmo bug fantasma do M39.1, mas não é — checado direto
+no Supabase: `liberacoes_ativas` tem 217 linhas reais (99 `liberado` + 118 `zerado`), e os 99
+`liberado` batem exato com os 99 de `cargas_ongo` (Frete Geral Ongo). A reconciliação do M41
+(15/07, marca `zerado` quem sumiu do pull do Ongo) está funcionando certa — o dado nunca esteve
+corrompido. O bug era só de exibição: `semaforoLiberacao()` já mapeia `zerado`/`cancelado` pra uma
+4ª cor "cinza" desde o M42, mas nenhum card mostrava essa cor — "Total de Lotes" contava
+`liberacoes.length` (todas as 217 linhas) enquanto os 3 cards coloridos somavam só as 99 ativas.
+Corrigido: card renomeado "Total de Lotes Ativos", conta só ativos (mesmo filtro que
+`volumeAtivoKg` já usava), com nota "+118 finalizado(s)" abaixo — transparente sem inflar o total
+nem confundir a soma. `frontend-torre/app/torre/liberacoes/page.tsx`. Validado ao vivo (mesmo
+navegador/servidores da validação do M44 acima).
+
+### M45 — WhatsApp/e-mail/portal por cliente — classificação rica — ✅ parcial (2026-07-15)
+Estende `webhook_evolution.py`: classificação além de `aviso`/`cotacao` atual
+(`liberacao_nova`/`reajuste`/`agendamento_longo`/`urgencia_caminhao`/`suspensao`/**`ordem_emitida`**)
++ validação cruzada com o portal (regra de precedência do M43). Depende do M43 (matcher) e
+idealmente do M44 (portal BTG) já existirem para o cruzamento fazer sentido de verdade.
+
+**Entregue (os 5 tipos de evento, não `ordem_emitida`):** `webhook_evolution.py` chama
+`classificar_evento_liberacao()` — mesma função/schema/trava de segurança construída pro M51
+(Gmail), reaproveitada 100% sem trabalho novo de classificação, só trocando `resolver_gmail` por
+`resolver_whatsapp`. Roda no mesmo ponto onde hoje a mensagem cai em "aviso" (não dobra custo de
+API pra cotação clara). Testado em produção com mensagem real simulada no grupo autorizado
+("lote 329312 teve reajuste, subiu pra 95/ton") — classificou `reajuste`, extraiu
+`identificador_origem=329312` e `valor_tonelada=95.0` corretamente, gravou em `liberacoes_eventos`
+(confirmado via Supabase, dado de teste removido depois).
+
+**`ordem_emitida` continua não implementado** — depende de amostra real por cliente/portal pra
+calibração few-shot (decisão de produto de 2026-07-14, ver abaixo), não tem como fazer sem esses
+exemplos reais ainda.
+
+**Decisão de produto (2026-07-14) — extração de `ordem_emitida`:** confirmado pelo usuário que cada
+cliente/portal/ERP emite ordem de carregamento num formato próprio ("cada portal tem seu modo
+único, cada ERP também"). Não é um parser universal — reaproveita o mesmo padrão do Fluxo Híbrido
+(PRD §9.3, decidido no M19): calibração via **perfil few-shot por cliente**, montado no onboarding
+(1 ordem real de cada cliente/portal → extrai o padrão do que ler/computar → vira exemplo injetado
+no prompt de extração daquele cliente específico). Fontes propostas pelo usuário: (1) grupo WhatsApp
+dedicado por transportadora ("Ordens Geral Transportadora X", PDF/imagem — mesmo mecanismo Vision já
+usado pra print de cotação, só muda a classificação de destino); (2) e-mail dedicado
+(`ordens@cliente.com.br`, mesmo padrão do `gmail_service.py`); (3) scraper por portal quando
+aplicável (BTG SMC via M44, outros conforme surgirem).
+
+**Reconciliação multi-fonte:** a mesma ordem pode chegar por portal + WhatsApp + e-mail
+simultaneamente — reaproveita 100% o matcher do M43 (mesmo padrão de deduplicação/candidate
+matching usado em `liberacoes_matcher_service.py`), não é arquitetura nova. Chave primária = número
+da ordem quando comparável entre fontes (usuário confirmou que não é difícil calibrar por cliente no
+fechamento); fallback = placa + motorista + data. Divergência de quantidade entre fontes numa mesma
+ordem é rara mas possível (confirmado pelo usuário) — cai na fila de revisão humana já existente do
+M43, mesma regra "portal manda sobre WhatsApp" já decidida na FASE 11.
+
+### M46 — Persistência de documento comprobatório — não iniciado
+Tabela `liberacoes_documentos` (imutável, nomeação automática lote-cliente-embarque-data, cadeia de
+reajuste sem sobrescrever) + mudança em `webhook_evolution.py` para **guardar** o print/imagem bruta
+(hoje descartada após a extração Vision), ligada ao lote resolvido pelo M43.
+
+### M47 — Contagem híbrida de aderência, trust ladder e margem por lote — ⚙️ migração aplicada (2026-07-14), feature não iniciada
+Contagem sugerida a partir da fonte estruturada (BTG SMC/Ongo), filial confirma/corrige em vez de
+digitar do zero; frequência de confirmação exigida cai conforme a divergência sistêmico x manual
+fica em zero por um tempo. Depende do M44 (contagem automática por caminhão) — segue não iniciado.
+
+**Migração aplicada (2026-07-14):** `backend/m47_aderencia_migration.sql` rodada pelo usuário no
+Supabase SQL Editor — `liberacoes_ativas` ganhou `frete_motorista_ton`, `caminhoes_no_local`,
+`caminhoes_em_transito`. Confirmado via REST (`GET liberacoes_ativas?select=...` → colunas presentes
+com defaults corretos). Só o schema — sem UI/produtor de dado ainda, feature completa segue
+bloqueada por M44.
+
+**Decisão de produto (2026-07-14, revisada no mesmo dia) — margem por LOTE, não por caminhão:**
+`liberacoes_ativas` ganha `frete_motorista_ton`, **distinto** do preço que o cliente liberou
+(`valor_tonelada`, já existente) — é o valor pago ao transportador terceirizado, **autorizado e
+digitado sempre pelo comercial** (nunca pela filial). Decisão inicial era "pode variar por caminhão
+dentro do lote"; revisada depois de conferir os arquivos reais (`Rag de Liberações/` — "Cadência
+Diária Nova Frota" e "PLANILHA DE CLIENTES GERAL", 51 abas de cliente incluindo BTG): as 3 abas
+checadas usam sempre **um par FRETE EMP/FRETE MOT. por lote**, nenhuma tem coluna de placa/motorista
+individual. Usuário confirmou: **não precisa de exceção de preço por caminhão** — granularidade
+final é sempre por lote. Também ganham `caminhoes_no_local` e `caminhoes_em_transito` (mapeando
+direto das colunas reais "NO LOCAL"/"EM TRANSITO"); `% aderência` é calculado em tela
+(`(no_local + em_transito) / cadencia_diaria`), não é coluna persistida. Visibilidade sem restrição
+(todo mundo na Torre vê os dois preços). A margem (`valor_tonelada - frete_motorista_ton`) é dado de
+negócio de primeira classe, não só um subproduto — precisa alimentar o card do M48 e o histórico do
+M50.
+
+**Backlog futuro (não iniciar agora) — drill-down por caminhão:** usuário propôs que clicar num
+número agregado (ex.: "1" em "No Local" do lote 329234) expanda e mostre placa/motorista/veículo
+daquele caminhão específico — a tabela principal continua por lote (grão agregado), o drill-down é
+só uma camada de detalhe visual por cima, não muda o schema de `liberacoes_ativas`. Depende de M45
+(captura de placa/motorista por evento) e M47 (confirmação de aderência) já existirem com esse dado
+granular pra ter o que exibir no clique.
+
+### M48 — Card de aderência automático (fim do print manual) — ✅ concluído 2026-07-20
+Botão "Copiar" por lote em `/torre/liberacoes` (coluna Ações) gera o texto formatado (cliente, rota,
+produto, cadência, No Local/Em Trânsito, % aderência, saldo, frete motorista, preço cliente,
+margem), reaproveitando o padrão "Copiar Dados Brutos" do drawer principal (`app/page.tsx`). Como
+M47 (trust ladder automático) virou opcional/não-bloqueante desde o M44 redefinido, este milestone
+não ficou bloqueado por ele — usa os mesmos campos que o input manual do M44 já preenche.
+
+**Decisão de produto (2026-07-14), implementada:** o texto mostra a margem financeira do lote
+(`valor_tonelada - frete_motorista_ton`), não só volume/contagem de caminhões.
+
+**Duplicação deliberada:** o texto é montado em 2 lugares — `buildTextoAderencia()` no frontend
+(client-only, pro botão Copiar) e `_montar_texto_aderencia()` no backend (`routers/liberacoes.py`,
+pro envio WhatsApp do M49, que precisa rodar server-side). Mesmo padrão de convivência já usado no
+projeto (`buildDadosBrutos` só-frontend vs. textos do `handoff.py` só-backend) — pequena duplicação
+aceitável em vez de um round-trip de rede só pra copiar texto que já está na tela.
+
+**Achado ao vivo (testado com o lote real `ongo#329516`, dado de teste revertido ao final):** o %
+de aderência divergia entre tela (63%) e texto do WhatsApp (62%) pro mesmo lote 62,5% — Python
+formata `.0f` com banker's rounding (arredonda .5 pro par mais próximo), JS `toFixed` arredonda .5
+sempre pra cima. Corrigido no backend com `int(pct + 0.5)` pra bater com o frontend.
+
+### M49 — Envio em tempo real pra filial (Evolution API) — ✅ implementado e testado 2026-07-20
+Botão "Notificar" por lote (mesma coluna Ações), ao lado do Copiar do M48. `POST
+/api/liberacoes/{id}/notificar` (backend) busca o lote + a filial (match por nome exato,
+case-insensitive, contra a tabela `filiais` do M54 — mesmo cadastro do handoff, sem CRUD novo),
+monta o texto do M48 e envia via `enviar_mensagem_whatsapp` (mesma infra do M54/M29.3) pros
+`responsavel_1/2_whatsapp` cadastrados. Proxy Next.js em
+`app/api/torre/liberacoes/[id]/notificar/route.ts`.
+
+**Decisão do usuário (2026-07-20) — ver PRD.md §9.11 pro desenho completo:** e-mail via Resend fica
+adiado pro backlog (não descartado). M49 entrou em execução só com WhatsApp, disparo **unitário**
+por lote/evento (reutiliza o padrão de botão do M54, não o padrão de job agendado do Despertador
+M29.3).
+
+**Trava mínima implementada:** header `X-Internal-Token`, comparado contra `INTERNAL_NOTIFY_TOKEN`
+(novo em `backend/.env` e `frontend-torre/.env.local`, gerado com `secrets.token_urlsafe`) — falha
+fechada (sem token configurado = sempre nega, nunca abre sozinho). Só o proxy Next.js conhece o
+token (server-side, nunca chega ao bundle do cliente) — endpoint específico não nasceu sem trava,
+como recomendado no achado #1 do raio-x, sem esperar o M58 inteiro.
+
+**Bug real achado e corrigido durante o teste ao vivo:** o check de token usava `os.getenv()`, que
+retorna `None` sempre — o backend carrega `.env` via `pydantic_settings.BaseSettings`
+(`core/config.py`, `env_file=".env"`), que popula o objeto `settings` mas **não propaga pro
+`os.environ`** do processo. Resultado: 401 mesmo com o token certo no header. Corrigido usando
+`from core.config import settings` / `settings.INTERNAL_NOTIFY_TOKEN` (mesmo padrão já usado por
+`OPENAI_API_KEY`/`SUPABASE_KEY` etc. no resto do backend) — nenhum outro `os.getenv()` novo deveria
+ser adicionado pra ler `.env` neste projeto, sempre via `core.config.settings`.
+
+**Testado ao vivo (Puppeteer + Supabase real, lote `ongo#329516`, dado revertido ao final):**
+fluxo sem filial cadastrada (toast "Nenhuma filial cadastrada com o nome...") ✅; fluxo com filial
+("Filial Matriz", cadastro real usado desde o teste do M54, WhatsApp = número do próprio usuário)
+✅ até a chamada ao Evolution API — autenticação, busca de lote+filial e montagem do texto todos
+corretos, mas o envio de fato retornou `enviado:false` porque o Evolution API (Baileys/instância
+"KM") só roda na VPS, não nesta máquina local (`ConnectError: getaddrinfo failed` em
+`localhost:8080`) — mesma limitação de ambiente já conhecida (M29.3/M54 têm a mesma dependência).
+**Confirmação do envio de fato só é possível apontando pra VPS ou fazendo deploy** — usuário aceitou
+essa validação ficar pro deploy (2026-07-20), não bloqueia o M49 como entregue.
+
+### M50 — Fechamento de lote → histórico + RAG — ✅ concluído e testado ao vivo 2026-07-20
+Ao lote fechar (`zerado`/`cancelado`), gera síntese do ciclo completo em `execucoes_lote` (tabela
+nova, `backend/m50_execucoes_lote_migration.sql`), alimenta o `historico_fechamentos` (RAG de preço
+já existente, mesma tabela do precificador) e o `torre_memoria_global` (RAG semântico já existente,
+`fonte="execucao_lote"`, reaproveitando `indexar_memoria_sync()`). Inclui o par `valor_tonelada` ×
+`frete_motorista_ton` do M47 — margem por lote/rota/cliente vira histórico de precificação, não só
+volume.
+
+**M46 (documentos comprobatórios) segue não iniciado** — dependência formal do PRD §9.7, mas
+decisão pragmática nesta sessão: seguir sem ele em vez de bloquear M50. `execucoes_lote.documentos_ids`
+(UUID[]) fica sempre vazio por ora; a síntese não referencia nenhuma prova. Quando M46 entrar, essa
+coluna passa a ser preenchida sem precisar reabrir o M50.
+
+**Gatilho implementado em `extract_ongo.py` (`_upsert_liberacoes_ativas`), não num cron novo:**
+reaproveita o ponto onde o M41 já reconciliava órfãos (lotes que somem do pull do Ongo). Antes do
+upsert da rodada, busca o status anterior de todos os lotes `fonte=ongo` numa única query; depois do
+upsert, calcula `fechados_agora` = união de 2 caminhos — (a) lotes que **o próprio Ongo** já reporta
+como `zerado`/`cancelado` nesta rodada mas estavam `liberado` na rodada anterior (caminho que a
+reconciliação de órfãos sozinha não cobria — ela só via quem *sumia* do feed, não quem o Ongo
+já marca como fechado mas continua listando); (b) os órfãos de sempre (sumiram do feed). Isso evita
+tanto perder fechamentos quanto disparar a mesma síntese em toda rodada seguinte (só dispara na
+transição `liberado` → fechado, nunca de novo pra quem já estava fechado).
+
+**Implementação nova em `memoria_global.py`** (script sync já usado por `extract_ongo.py`, versão
+local de `services/memoria_global_service.py`): `registrar_execucao_lote_sync()` monta a síntese,
+grava (upsert) em `execucoes_lote`, gera 1 embedding e grava em `historico_fechamentos`, e chama
+`indexar_memoria_sync()` de novo pro `torre_memoria_global` (2 chamadas de embedding pro mesmo texto
+— aceitável, custo de `text-embedding-3-small` é irrisório, evita mexer na assinatura de uma função
+já usada por outros chamadores). Best-effort — nunca derruba o ciclo do Ongo se OpenAI/Supabase
+falharem, mesma política do resto do arquivo.
+
+**Testado ao vivo (Supabase real, lote sintético baseado em `ongo#329516`, dado revertido ao
+final):** `registrar_execucao_lote_sync()` chamado diretamente confirmou as 3 escritas corretas —
+margem R$15,00/t, `valor_total` R$49.000 (`valor_tonelada × volume_embarcado`), `volume_toneladas`
+700t, embedding gerado, `texto_busca`/`texto_resumo` formatados certo. A lógica de diff
+(`fechados_agora`) foi testada isoladamente (sem tocar o banco) com 4 cenários — lote ativo, lote que
+o Ongo acabou de fechar, lote já fechado antes (não deve disparar de novo), lote que sumiu do feed —
+todos corretos. **Não testado ainda**: o ciclo real completo do `extract_ongo.py` (scrape Playwright
++ Task Scheduler) disparando isso em produção — só a função e a lógica isoladamente.
+
+### M51 — E-mail por cliente ✅ concluído (2026-07-15)
+Mesma extensão de classificação rica do M45, em cima do `gmail_service.py` já existente. Depende do
+M43.
+
+**Entregue:**
+- `models/schemas.py` — novo `EventoLiberacaoSchema` (`eh_evento_liberacao`, `tipo_evento` dos 5
+  tipos do M43, `identificador_origem`, `cliente`, `valor_tonelada`, `observacao`,
+  `nivel_confianca` alta/media/baixa — nota: schema separado de `CargaLogisticaSchema` porque
+  esses eventos não são cotação nova, referenciam algo já existente).
+- `services/openai_service.py` — `classificar_evento_liberacao()`, prompt dedicado (sem few-shot
+  ainda — falta amostra real, mesma lacuna do M45/M16). **Trava de segurança:** qualquer
+  `nivel_confianca=alta` retornado pelo modelo é rebaixado pra `media` no código antes de
+  gravar — nunca deixa esse classificador novo aplicar sozinho via M43 (`confianca_alta` só
+  passa com `alta` de verdade), cai sempre na fila de revisão até termos amostra real validada.
+- `services/liberacoes_matcher_service.py` — `inserir_evento_liberacao_sync()`, grava em
+  `liberacoes_eventos` (mesmo destino que M44/M45 vão usar — matcher do M43 já sabe processar).
+- `services/gmail_service.py` — chama o classificador novo **só** quando a extração de cotação
+  normal não achou origem/destino (evita dobrar custo de API no caso comum). Contador
+  `eventos_liberacao` novo no resumo do ciclo.
+- Testado com 4 mensagens sintéticas (reajuste, urgência, suspensão, ruído) — **zero-shot, sem
+  nenhum exemplo real, acertou tipo/ID/valor nos 3 primeiros e não deu falso positivo no
+  quarto.** Testado também a gravação real em `liberacoes_eventos` (inserido, confirmado via
+  leitura, removido). Deploy validado — ciclo real do Gmail rodou limpo em produção com o
+  contador novo aparecendo no log.
+
+**Compartilhável com M45:** toda a lógica (schema, prompt, writer) é agnóstica de canal — aplicar
+no WhatsApp (`webhook_evolution.py`) é só chamar `classificar_evento_liberacao()` no mesmo ponto
+onde hoje cai em "aviso", zero trabalho novo de classificação.
+
+### M52 — Projeção Google Sheets filtrável ✅ concluído (2026-07-15)
+Espelho de leitura gerado a partir do Supabase (nunca editado por fora) — pro comercial filtrar e
+enviar o link/cópia pra ponta (filial/transportadora), mesmo padrão de distribuição que o grupo BTG
+já usa hoje com links de Sheets manuais. Se algo precisar escrever de volta (ex.: confirmação de
+contagem do M47), vai numa aba de input separada, sincronizada por job — nunca editando a aba
+consolidada diretamente. Depende do M42.
+
+**Entregue:**
+- `services/sheets_service.py` ganhou `sincronizar_liberacoes()` — reescreve a aba "Liberações
+  Ativas" (mesmo spreadsheet do `GOOGLE_SHEET_ID`, onde já vivem "Carregamentos"/"Fretes
+  Capturados") do zero a cada sync: limpa e escreve cabeçalho + snapshot atual completo de
+  `liberacoes_ativas`. Diferente de `injetar_frete()` (append incremental) — aqui é sempre
+  "estado atual", não histórico. Filtro fica por conta do próprio Google Sheets (comercial usa
+  os filtros nativos da planilha pra recortar o que enviar pra cada ponta), não geramos views
+  parametrizadas por request.
+- `routers/liberacoes.py` — `POST /api/liberacoes/sync-sheets`, `app/api/torre/liberacoes/
+  sync-sheets/route.ts` no proxy. Botão "Sincronizar Planilha" no header de `/torre/liberacoes`
+  — sincroniza e abre a planilha numa aba nova, mesmo padrão "Abrir Planilha" já usado no Ongo
+  Geral (M15).
+- Testado em produção via Puppeteer: clique real no botão → toast "167 lote(s) sincronizado(s)!"
+  → aba nova com a planilha atualizada.
+
+**Armadilha nova (2026-07-15) — token do Sheets era só leitura:** `services/sheets_reader.py`
+(usado desde M2) só tinha escopo `spreadsheets.readonly`; escrever exigiu reautorizar
+`token_sheets.json` com escopo `spreadsheets` completo (`autorizar_sheets.py` atualizado). Na
+primeira tentativa a conta reautorizada (`octamoveai@gmail.com`, mesma do Gmail) deu 403 na
+planilha — **descoberta importante: o dono real da planilha (`GOOGLE_SHEET_ID`) é
+`edastorga0@gmail.com`, não a conta de automação.** Resolvido sem precisar de mais nenhuma ação
+manual do usuário: a conta de serviço já usada pelo `extract_ongo.py`
+(`robot-extractor@octamove-extractor.iam.gserviceaccount.com`, tem escopo `drive` completo)
+adicionou `octamoveai@gmail.com` como Editor via API (`drive.permissions().create()|`). Backup do
+token antigo baixado da VPS antes de qualquer mudança arriscada, restaurado uma vez no meio do
+processo quando a leitura quebrou temporariamente — nenhuma funcionalidade em produção ficou
+fora do ar (a VPS só recebeu o token novo depois de tudo validado localmente).
+
+### M53 — Conciliação Projetado × Real (ordem × ticket de balança + nota fiscal) — backlog futuro, não iniciar sem pedido explícito
+**Origem:** usuário identificou (2026-07-14) que a quantidade (toneladas) na ordem de carregamento é
+**projetada** — a ordem é emitida antes do carregamento. O peso real só existe depois, via ticket de
+balança + nota fiscal. Cruzar projetado × real é "de muito valor saber o que realmente foi
+carregado" (palavras do usuário) — mas é um módulo à parte. **Decisão explícita: registrar como
+backlog, não começar a implementar junto com M44-M52.** Depende de M45 (ingestão de ordem) e M46
+(persistência de documento — o ticket/nota também são documentos comprobatórios).
+
+---
+
+## FASE 12 — Handoff Comercial → Filial → Diretoria → Cliente via WhatsApp — M54 concluído (2026-07-14)
+
+**Origem:** auditoria a partir de `no-grain-os/Auditoria 14 07/` — gap identificado no bloco 2.2 do
+fluxo comercial (não no módulo de Liberações da FASE 11): hoje "cotar com a filial" é 100% manual
+(telefone/print avulso), sem handoff dentro da Torre. Confirmado pelo usuário que esse padrão
+(aviso automático por WhatsApp no handoff entre etapas) já é usado por TMS brasileiro (ESL Sistemas,
+DATAFRETE) — não é ideia especulativa.
+
+### M54 — Botão de handoff por filial no Drawer + magic link ✅ concluído (2026-07-14)
+**Escopo:** dropdown "Enviar para filial" no `CotacaoDrawer`, ao lado do campo "Preço Comercial
+Final" (não no card da lista — ali precisa ficar enxuto pra escanear muitas cotações, mesmo
+princípio do M13). Ao selecionar a filial e confirmar, dispara mensagem via Evolution API
+(reaproveita 100% `digest_service.py`, mesmo mecanismo do Despertador Matinal) com os dados-chave da
+cotação + um magic link.
+
+**Decisões de produto confirmadas (2026-07-14):**
+- Cadastro de filial: nome + até 2 responsáveis + WhatsApp, numa tabela simples editada direto no
+  Supabase por enquanto (sem CRUD dedicado — muda raramente, só quando funcionário sai).
+- Segurança do link: **não precisa nível bancário** (proporcional ao risco real — pior caso é
+  alguém ver/alterar o preço de uma cotação específica já em revisão pelo comercial). Magic link
+  escopado só àquela cotação, token único criptograficamente aleatório, expira em horas (não
+  minutos — filial não abre na hora), sem tela de login/senha.
+- Cadeia comercial → filial → diretoria → cliente é a ordem geral, mas **configurável por
+  cliente/contrato** (cada cliente fechado pode ter ordem diferente) — não fixar no código como
+  regra única.
+- Quando a filial responde o preço, o card muda de estado pra o comercial ver (ex.: preço filial
+  em verde) e cai pra diretoria — mesma lógica de roteamento por margem que já existe (M6/M7),
+  não substitui, só adiciona o gatilho de envio/retorno.
+
+**Depende de:** nenhuma tabela nova crítica — reaproveita `digest_service.py`/Evolution API (M29.3)
+e o funil de status já existente (M6/M7). Precisa só da tabela de cadastro de filiais + o
+campo/estado novo no Drawer.
+
+**Entregue:**
+- `backend/m54_handoff_migration.sql` — tabelas `filiais` (cadastro simples) e `cotacao_handoffs`
+  (token único, `cotacao_id` TEXT pra cobrir a mesma dualidade painel_fretes/Trizy já tratada em
+  `cotacoes.py`, `expira_em`, `preco_filial`). Aplicada pelo usuário no Supabase SQL Editor.
+- `backend/routers/cotacoes.py` — extraída `aplicar_preco()` do endpoint `PATCH /preco` (mesmo
+  cálculo de margem/roteamento M6/M7, agora reaproveitado também pelo handoff, sem duplicar lógica).
+- `backend/routers/handoff.py` (novo) — `GET /api/handoff/filiais`, `POST
+  /api/handoff/cotacoes/{id}/enviar` (gera token, dispara WhatsApp via `evolution_service.py` pros
+  responsáveis da filial com link `FRONTEND_URL/handoff/{token}`), `GET /api/handoff/{token}`
+  (consulta pública, valida expiração), `POST /api/handoff/{token}/responder` (chama
+  `aplicar_preco()`, marca handoff como `respondido`, bloqueia resposta duplicada com 409).
+- Frontend: dropdown "Enviar para Filial" no rodapé do `CotacaoDrawer` (`app/page.tsx`), acima do
+  campo "Preço Comercial Final" como decidido; proxies `app/api/handoff/filiais`,
+  `app/api/cotacoes/[id]/enviar-filial`, `app/api/handoff/[token]` (GET+POST responder); página
+  pública `app/handoff/[token]/page.tsx` — sem login, mostra origem/destino/produto/volume/embarcador
+  e input de preço pra filial responder.
+
+**Testado ponta a ponta (local, dados reais revertidos ao final):**
+1. Via curl direto no backend: filial de teste criada → `enviar` gerou token e tentou WhatsApp
+   (falhou local porque Evolution API não roda nesta máquina — best-effort, mesmo comportamento já
+   existente do `digest_service.py`, não é bug novo) → `GET /{token}` retornou os dados certos da
+   cotação real → `responder` com preço sem ANTT piso conhecido → `COTACAO_FILIAL` (margem 100%,
+   comportamento correto); segunda rodada com `antt_piso_por_ton=90` e preço 95 → margem 5,26% →
+   `APROV_DIRETORIA` — os dois ramos do roteamento por margem confirmados. Resposta duplicada no
+   mesmo token → 409. Token inexistente → 404.
+2. Via navegador real (Puppeteer, servers locais): Drawer abriu, dropdown populado com a filial de
+   teste via `GET /api/handoff/filiais`, clique em "Enviar" criou o handoff de verdade pela UI,
+   `/handoff/{token}` renderizou os dados reais da cotação, preço submetido pela UI → tela de
+   sucesso "Preço enviado! Já pode fechar essa aba" → confirmado no Supabase que `painel_fretes`
+   atualizou `status`/`preco_proposto` e `cotacao_handoffs.status='respondido'`.
+3. `npx tsc --noEmit` e `npm run build` limpos (novas rotas `/api/handoff/*`, `/handoff/[token]`
+   geradas corretamente).
+- Todos os dados de teste (filial, handoffs, alterações na cotação real usada) revertidos/removidos
+  ao final de cada rodada.
+
+**Deploy:** `deploy_vps.py` rodado após os testes locais — `GET
+http://2.24.201.246:8000/api/handoff/filiais` → 200, `http://2.24.201.246:3000/handoff/tokenfalso` →
+200 (renderiza estado de erro "link inválido" corretamente) em produção.
+
+**Não coberto nesta entrega (segue como está, fora do escopo do M54):** envio real de WhatsApp em
+produção não testado ao vivo (só a chamada à Evolution API, que já é o mecanismo validado do M29.3);
+cadastro de filiais reais fica pro usuário popular direto no Supabase, como decidido (sem CRUD).
+
+**Validado com uso real em produção + enriquecimento do link (2026-07-16):** usuário testou o
+fluxo completo pela Torre de verdade — WhatsApp chegando, link abrindo, preço respondido, status
+mudando (`COTACAO_FILIAL`) — confirmado pelo menos 2x com sucesso nos logs (`respondido preco=125`,
+`respondido preco=135`). Achado no processo: o link público mostrava só 5 campos (origem, destino,
+produto, volume, embarcador) — insuficiente pra filial cotar de verdade. **Decisão de produto:**
+enriquecer o link público em vez de apontar pra auditoria interna da Torre (manteria o escopo de
+segurança já decidido — só aquela cotação, sem acesso ao resto do sistema). `_buscar_cotacao()` em
+`handoff.py` expandido pra trazer contato, ponto de coleta/entrega (nome do local), veículo,
+cadência, prazo, KM real, pedágio, piso ANTT e links do Maps — tanto de `painel_fretes` quanto de
+`octamove_extracao_trizy` (com os gaps já conhecidos do Trizy: sem veículo/pedágio/piso ANTT,
+mesma limitação do M13). `app/handoff/[token]/page.tsx` atualizado pra exibir tudo isso, ocultando
+campos vazios em vez de mostrar "—" (mais limpo pra fontes com menos dado, como Trizy). Testado em
+produção com cotação Trizy real (BID SIPAL, Brasnorte→Campos de Júlio): todos os campos disponíveis
+renderizaram certo, botões de Maps funcionando.
+
+---
+
+## FASE 13 — Refinamento Efetividade Comercial (2026-07-14) — ✅ completa (2026-07-15)
+
+**Origem:** mesma auditoria de `Auditoria 14 07/` — 3 gaps apontados pelo usuário na tela
+`/torre/efetividade` (M31/M31.1, já em produção), confirmados como ferramenta de **dono/gestor**
+avaliando o time comercial (sem login/atribuição individual, decisão já tomada no M31.1).
+
+### M55 — Drill-down por cliente ✅ concluído (2026-07-15)
+Clicar no nome do cliente na tabela de Efetividade abre o histórico completo de cotações daquele
+cliente (mesmos campos do Drawer de hoje) — hoje só existe o número agregado. Consulta apenas
+(não precisa permitir reabrir cotação a partir dali na primeira versão).
+
+**Entregue:** `app/torre/efetividade/page.tsx` — nome do cliente na tabela virou botão; abre gaveta
+lateral (mesmo padrão visual dos outros drawers do projeto) com tabela Data/Rota/Produto/Valor/
+Status, ordenada por mais recente. **"Histórico completo" de propósito ignora o filtro de período
+da tela** — usa o array `cotacoes` cheio (já carregado em memória), filtrado só pelo cliente
+normalizado (mesmo `chaveCliente`/`construirMapaClientes` já usados na agregação principal), não o
+`cotacoesPeriodo` filtrado por data. Consulta apenas — sem botão de reabrir/editar, como decidido.
+Testado em produção via Puppeteer: cliente com 21 cotações no período de 30 dias mostrou 26 no
+histórico completo (confirma que o filtro de data da tela não vaza pro drill-down), status colorido
+correto (verde/vermelho/violeta conforme o funil M6/M7), botão fechar funcionando.
+
+### M56 — Projeção Google Sheets para cotações gerais ✅ concluído (2026-07-15)
+Mesmo padrão já validado do "Ongo Geral" (M15) e planejado pra Liberações (M52) — espelho de
+leitura gerado do Supabase, nunca editado por fora, botão "Abrir Planilha" dentro da Torre.
+Cobre as cotações gerais (WhatsApp/Gmail/Trizy), que hoje não têm nenhuma projeção externa.
+
+**Entregue:** mesma receita do M52, aplicada a um dataset diferente.
+- `services/sheets_service.py` — `sincronizar_cotacoes_gerais()`, aba nova "Cotações Gerais" no
+  mesmo spreadsheet (`GOOGLE_SHEET_ID`). Colunas: Fonte, Cliente/Embarcador, Origem, Destino,
+  Produto, R$/Ton, Status, Recebida em. **Não inclui Ongo/Carregamentos** de propósito — isso já
+  é dado de mercado do M15, não cotação nossa.
+- `routers/fretes.py` — `POST /fretes/sync-sheets`, junta `painel_fretes` (WhatsApp+Gmail, via
+  `supabase_reader.listar_fretes()` já existente) com `octamove_extracao_trizy` (query nova,
+  backend não tocava essa tabela antes — só o frontend lia direto).
+- Botão "Sincronizar Planilha" no header da Torre (`app/page.tsx`), ao lado de "Liberações &
+  Aderência"/"Efetividade Comercial" — mesmo padrão visual e de interação do M52.
+- Testado local (92 linhas, conteúdo da planilha conferido campo a campo) e em produção via
+  `curl` direto no endpoint (sem passar por navegador, pra não abrir aba na tela do usuário à
+  toa) — 92 cotações sincronizadas, HTTP 200.
+
+### M57 — Redesign do card "Melhor Conversão" ✅ concluído (2026-07-15)
+**Gatilho:** usuário notou card mostrando "TRC TEAK 0%" destacado em verde — 0% de conversão
+colorido como se fosse bom sinal, sintoma de ranking sem confiança estatística suficiente.
+
+**3 opções apresentadas com mockup + dado real da própria Torre antes de construir** (A: só travar
+cor por amostra mínima; B: trocar "Melhor Conversão" por "Precisa de Atenção", volume alto +
+conversão baixa; C: score composto multi-fator). **Usuário escolheu B.**
+
+**Entregue:** `app/torre/efetividade/page.tsx` — card "Melhor Conversão" (emerald, troféu) virou
+"⚠ Precisa de Atenção" (âmbar, alerta). Critério: `atencaoScore = total * (100 - (taxaConversao ??
+50)) / 100` — pondera volume pela conversão ruim; cliente sem decisão ainda (taxaConversao null)
+usa 50 como neutro, não é penalizado só por estar em andamento. Card fica clicável, abre o mesmo
+drill-down do M55 (reaproveita 100%, zero código novo pra isso). Testado em produção: SIPAL
+INDUSTRIA E COMERCIO LTDA (21 cotações, 0% conversão — maior volume do período, zero fechamento)
+corretamente identificado e destacado; clique abriu o histórico completo (26 cotações) certo.
+
+---
+
+## FASE 14 — Blindagem e Saneamento Técnico (Auditoria Raio-X 2026-07-17) — 🔜 backlog, não iniciada
+
+**Origem:** raio-x autônomo de engenharia + mercado (Claude Code) cobrindo as 9 funcionalidades da
+Torre, seguido de 3 testes de regressão (QualP, piso ANTT, Auto-Loss — 73 checks, todos passando) e
+1 checagem read-only contra produção real. Tabela completa de achados (impacto negativo, solução,
+impacto positivo, esforço estimado) em PRD.md 9.10 — não duplicada aqui, só o backlog técnico.
+
+| Milestone | Achado (PRD 9.10) | Prioridade |
+|---|---|---|
+| M58 | Camada de autenticação mínima em toda a Torre (proxies + backend) | **Crítica — bloqueador de venda multi-cliente** |
+| M59 | Blindagem do webhook Evolution (validação de origem + dedupe por `msg_id`) | Alta |
+| M60 | Conectar a Memória Global — implementar busca real sobre `buscar_memoria_similar` (hoje write-only) | Média |
+| M61 | Eliminar N+1 no matcher de Liberações + no Auto-Loss (batch em vez de loop linha a linha) | Média |
+| M62 | Consolidar polling do Dashboard + fonte única (Supabase) pro Frete Geral Ongo, remover leitura síncrona do Sheets do hot path | Alta |
+| M63 | Remover segredos hardcoded (chave Evolution, URL Supabase de produção) | Alta (barato, fazer logo) |
+| M64 | CI mínimo (GitHub Action ou pre-commit) rodando `test_qualp_rota.py`/`test_antt_piso.py`/`test_auto_loss.py` a cada push | Alta (protege o que já foi testado) |
+| M65 | Saneamento de UX de falha silenciosa (toast padronizado + rollback) e troca do `window.prompt()` de Liberações por seletor real | Média |
+| M66 | Aviso visível na calculadora quando piso ANTT cai no fallback (categoria/eixo sem coeficiente real no Supabase) | **Alta — risco legal confirmado em produção** |
+
+---
+
 ## PRÓXIMOS MILESTONES (Backlog)
 
 | # | Milestone | Descrição | Prioridade |
@@ -1520,7 +2145,8 @@ sozinho na próxima execução, sem precisar rodar nada manual agora.
 | M10 | Trizy — Alerta WhatsApp novo BID | Enviar mensagem via Evolution API quando novo BID chega com produto/rota de interesse — velocidade de reação em leilão | Alta |
 | M11 | Trizy — CRM N8N | Rebaixado (2026-07-08) — automação nativa via cron (M29.2/M29.3) já cobre o mesmo valor sem depender de ferramenta externa. Reconsiderar só se surgir caso de uso que N8N resolva e a Torre não | Baixa |
 | — | Ongo Aba Aderência | Implementar aba "Aderência Transportadoras" (check-in/reagendamento/score por transportadora) no `extract_ongo.py` — ver M15 | Média |
-| — | Ongo Task Scheduler na VPS | Hoje roda local no Windows do usuário; migrar pra cron na VPS tornaria o fechamento 23:55 independente do notebook estar ligado | Média |
+| — | Ongo Task Scheduler na VPS | Hoje roda local no Windows do usuário; migrar pra cron na VPS tornaria o fechamento 23:55 independente do notebook estar ligado. **Evidência concreta 2026-07-14:** `ongo_cron.log` confirma que o job das 23:55 não disparou na noite de 11/07 (pula de "10/07 Liberado" pra "12/07 Liberado" às 09:19, execução de recuperação manhã seguinte) — Histórico daquele dia ficou vazio, sem possibilidade de recuperação retroativa (fechamento lê estado atual, não snapshot preservado) | Média |
+| ~~—~~ | ~~Delay do Gmail (1min)~~ | ✅ Resolvido 2026-07-14 — `GMAIL_POLL_INTERVAL_MINUTES=1` → `GMAIL_POLL_INTERVAL_SECONDS=20` em `backend/main.py` (cota da Gmail API desprezível nesse intervalo). Editado localmente, **ainda não deployado na VPS** | — |
 | — | Adicionar grupos de frete reais | Incluir grupos como "Fretes MT", "APCAM FRETES", "Fretes Rondonópolis" no `GRUPOS_PERMITIDOS` | Média |
 | ~~—~~ | ~~Popular `historico_fechamentos`~~ | ✅ RAG ativo com dado real — 408 linhas (288 legado + 120 novas já limpas em 07/07), crescendo diariamente via cron 23:55 | — |
 | — | Notificações push | Alerta sonoro/visual quando nova cotação chega na Torre | Baixa |

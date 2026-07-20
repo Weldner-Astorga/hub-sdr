@@ -22,11 +22,14 @@ import os
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+from memoria_global import indexar_memoria_sync, registrar_execucao_lote_sync
+from whatsapp_alert import alertar_falha, alertar_sem_localizacao
 
 # Console do Windows usa cp1252 por padrão (fora de um terminal UTF-8 real ou
 # quando a saída é redirecionada/piped, como no run_ongo_diario.bat) — vários
@@ -63,6 +66,11 @@ POLL_INTERVAL = 300  # segundos (5 minutos)
 
 STATUS_CARGA = {0: "Em andamento", 1: "Concluída", 2: "Cancelada", 3: "Expirada"}
 
+# M41 — mapeia statusDaCarga pro enum consolidado de liberacoes_ativas.status
+# (ver backend/liberacoes_migration.sql / MILESTONES.md FASE 11). "Expirada"
+# entra como "cancelado" por ora — não há distinção de negócio ainda entre as duas.
+STATUS_LIBERACAO = {0: "liberado", 1: "zerado", 2: "cancelado", 3: "cancelado"}
+
 STATUS_AGENDAMENTO = {
     0: "Cancelado", 1: "Agendado", 2: "A caminho", 3: "Chegou",
     4: "Em carregamento", 10: "No terminal", 11: "Carregado", 12: "Saiu", 13: "Entregue",
@@ -89,6 +97,20 @@ AGEND_COLUMNS = [
     "Data/Hora Agendada", "Check-in", "Reagendado",
 ]
 AGEND_COL_WIDTHS = [130, 90, 180, 180, 130, 200, 90, 180, 180, 160, 140, 140, 130, 140, 70, 80]
+
+# ── Aba Sem Localização (M32) ───────────────────────────────────────────────
+
+SEM_LOCALIZACAO_COLUMNS = ["Data Captura", "ID Frete", "ID Caminhão", "Último Ping", "Status Frete"]
+SEM_LOCALIZACAO_COL_WIDTHS = [130, 90, 100, 160, 120]
+
+# ── Aba Descarregamentos / Compliance (M34) ─────────────────────────────────
+
+DESCARGA_COLUMNS = [
+    "Cotação", "Transportadora", "Motorista", "Placas", "Origem", "Carregamento",
+    "Destino", "Peso Descarregado (KG)", "Data Descarga",
+    "Desligou Localização", "Substituiu Foto", "Tem Foto",
+]
+DESCARGA_COL_WIDTHS = [90, 180, 160, 140, 200, 140, 200, 150, 140, 130, 120, 90]
 
 # ── Aba Aderência ────────────────────────────────────────────────────────────
 
@@ -669,6 +691,176 @@ def _fetch_valor_proposto(page, ids: list, api_headers: dict) -> tuple:
     return valor_map, terminal_map
 
 
+# ---------------------------------------------------------------------------
+# M32 — Alerta "Sem Localização" (endpoint achado por exploração em 2026-07-08:
+# v2/api/DashboardCargas/listagem-all-dashboard-geolocations, mesmo dado que
+# alimenta o widget "Sem Localização" do Dashboard nativo do Ongo)
+# ---------------------------------------------------------------------------
+
+GEOLOCATIONS_URL = "https://api.ongocargas.com.br/v2/api/DashboardCargas/listagem-all-dashboard-geolocations"
+
+
+def _fetch_geolocations(page) -> list:
+    """Última posição conhecida por caminhão/frete ativo.
+
+    Achado do diagnóstico 2026-07-08: esse endpoint é alimentado pelo widget
+    "Cargas no Mapa" do próprio Dashboard — não dá pra replicar via fetch()
+    manual com headers de auth crus (retorna 'success:true, data:[]' vazio,
+    sem erro). Precisa escutar a resposta de verdade enquanto o Dashboard
+    carrega, mesmo padrão de _fetch_lista() pro /carregamentos.
+    """
+    result = {"items": []}
+
+    def _on_resp(resp):
+        if "listagem-all-dashboard-geolocations" in resp.url:
+            try:
+                body = resp.json()
+                items = body.get("data", [])
+                if items:
+                    result["items"] = items
+            except Exception:
+                pass
+
+    page.on("response", _on_resp)
+    try:
+        page.goto(PAINEL_URL, wait_until="networkidle", timeout=15_000)
+        page.wait_for_timeout(1_500)
+    except PlaywrightTimeoutError:
+        pass
+    page.remove_listener("response", _on_resp)
+    return result["items"]
+
+
+def _detectar_sem_localizacao(geolocations: list) -> list:
+    """Pega o ping mais recente por idFrete e retorna só os marcados isOffline
+    pelo próprio Ongo — mesmo critério que o widget nativo usa, sem inventar
+    limiar de horas por conta própria."""
+    mais_recente: dict = {}
+    for g in geolocations:
+        idf = g.get("idFrete")
+        if idf is None:
+            continue
+        atual = mais_recente.get(idf)
+        if atual is None or (g.get("date") or "") > (atual.get("date") or ""):
+            mais_recente[idf] = g
+    return [g for g in mais_recente.values() if g.get("isOffline")]
+
+
+def _map_sem_localizacao_rows(offline: list, timestamp: str) -> list:
+    return [
+        {
+            "Data Captura":  timestamp,
+            "ID Frete":      g.get("idFrete"),
+            "ID Caminhão":   g.get("idCaminhao"),
+            "Último Ping":   _fmt_dt(g.get("date") or ""),
+            "Status Frete":  g.get("freteStatus"),
+        }
+        for g in offline
+    ]
+
+
+# ---------------------------------------------------------------------------
+# M34 — Score de Compliance de Descarga (endpoint achado por exploração em
+# 2026-07-08: v1/api/Frete/listagem-analise-descarga)
+# ---------------------------------------------------------------------------
+
+def _fetch_analise_descarga(page, api_headers: dict, dias: int = 4) -> list:
+    """Análises de descarga (compliance) da janela dos últimos `dias` dias."""
+    if not api_headers:
+        return []
+    fim = datetime.now(timezone.utc)
+    ini = fim - timedelta(days=dias)
+    url = (
+        "https://api.ongocargas.com.br/v1/api/Frete/listagem-analise-descarga/"
+        f"200/0/{ini.strftime('%Y-%m-%dT%H:%M')}/{fim.strftime('%Y-%m-%dT%H:%M')}/null/null/null/null"
+    )
+    try:
+        data = page.evaluate(
+            """
+            async ({url, headers}) => {
+                const r = await fetch(url, {headers});
+                return r.json();
+            }
+            """,
+            {"url": url, "headers": api_headers},
+        )
+        return (data.get("data") or {}).get("data", []) or []
+    except Exception as exc:
+        print(f"[LOG {_ts()}] ERRO ao buscar análise de descarga (M34): {exc}")
+        return []
+
+
+def _map_descarga_rows(registros: list) -> list:
+    """Achata o array 'children' (1 descarga pode ter varios destinos) em
+    linhas simples. Campos booleanos ficam Sim/Nao crus - sem inventar um
+    score X/4 proprio, ja que nao confirmamos a formula exata que o portal usa."""
+    rows = []
+    for r in registros:
+        origem = _strip_code_prefix(r.get("origem") or "")
+        filhos = r.get("children") or [{}]
+        for child in filhos:
+            rows.append({
+                "Cotação":                r.get("idCotacao"),
+                "Transportadora":         r.get("transportadoraName"),
+                "Motorista":              r.get("motoristaName"),
+                "Placas":                 r.get("placas"),
+                "Origem":                 origem,
+                "Carregamento":           _fmt_dt(r.get("carregamento") or ""),
+                "Destino":                _strip_code_prefix(child.get("destinoName") or ""),
+                "Peso Descarregado (KG)": child.get("pesoDescarregado"),
+                "Data Descarga":          _fmt_dt(child.get("dataDescarga") or ""),
+                "Desligou Localização":   "Sim" if r.get("desligouLocalizacao") else "Não",
+                "Substituiu Foto":        "Sim" if r.get("substituicaoFotoDescarga") else "Não",
+                "Tem Foto":               "Sim" if child.get("fotoDescarregamento") else "Não",
+            })
+    return rows
+
+
+def _upsert_descarregamentos(registros: list) -> None:
+    """Grava snapshot no Supabase (ongo_descarregamentos) pra permitir score
+    agregado por motorista/transportadora ao longo do tempo (M34)."""
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not supabase_url or not supabase_key or not registros:
+        return
+    try:
+        from supabase import create_client
+    except ImportError:
+        return
+
+    rows = []
+    for r in registros:
+        origem = _strip_code_prefix(r.get("origem") or "")
+        for child in (r.get("children") or [{}]):
+            id_destino = child.get("idFreteDestino")
+            if id_destino is None:
+                continue
+            rows.append({
+                "id_cotacao":            r.get("idCotacao"),
+                "id_frete_destino":      id_destino,
+                "transportadora":        r.get("transportadoraName"),
+                "motorista":             r.get("motoristaName"),
+                "placas":                r.get("placas"),
+                "origem":                origem,
+                "destino":               _strip_code_prefix(child.get("destinoName") or ""),
+                "peso_descarregado_kg":  child.get("pesoDescarregado"),
+                "data_descarga":         child.get("dataDescarga") or None,
+                "desligou_localizacao":  bool(r.get("desligouLocalizacao")),
+                "substituiu_foto":       bool(r.get("substituicaoFotoDescarga")),
+                "tem_foto":              bool(child.get("fotoDescarregamento")),
+            })
+    if not rows:
+        return
+    try:
+        client = create_client(supabase_url, supabase_key)
+        client.table("ongo_descarregamentos").upsert(
+            rows, on_conflict="id_cotacao,id_frete_destino",
+        ).execute()
+        print(f"[LOG {_ts()}] Supabase: {len(rows)} descarregamento(s) sincronizado(s) (M34).")
+    except Exception as exc:
+        print(f"[LOG {_ts()}] ERRO ao sincronizar ongo_descarregamentos: {exc}")
+
+
 def _fetch_agendamentos(page) -> list:
     result = {"grupos": []}
 
@@ -1083,6 +1275,30 @@ def _push_to_sheets(mapped: list, mapped_agend: list, mapped_ader: list,
     print(f"[LOG {_ts()}] Sheets atualizado — {n_hist} linha(s) nova(s) no Histórico.")
 
 
+def _push_valor_transportadora_sheets(sem_localizacao_rows: list, descarga_rows: list) -> None:
+    """Abas do FASE 10 (M32/M34) — full-refresh a cada ciclo, mesmo padrão das
+    demais abas. Looker Studio conecta direto nessas abas pro dashboard (decisão
+    2026-07-08, ver MILESTONES.md FASE 10)."""
+    if not sem_localizacao_rows and not descarga_rows:
+        return
+    gc = _sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+
+    if sem_localizacao_rows:
+        ws, is_new = _get_or_create_ws(sh, "Sem Localização")
+        _write_ws(ws, SEM_LOCALIZACAO_COLUMNS, sem_localizacao_rows)
+        if is_new:
+            _format_ws_header(sh, ws, SEM_LOCALIZACAO_COLUMNS, SEM_LOCALIZACAO_COL_WIDTHS,
+                               bg_r=0.60, bg_g=0.15, bg_b=0.15)
+
+    if descarga_rows:
+        ws, is_new = _get_or_create_ws(sh, "Descarregamentos")
+        _write_ws(ws, DESCARGA_COLUMNS, descarga_rows)
+        if is_new:
+            _format_ws_header(sh, ws, DESCARGA_COLUMNS, DESCARGA_COL_WIDTHS,
+                               bg_r=0.15, bg_g=0.30, bg_b=0.55)
+
+
 # ---------------------------------------------------------------------------
 # Schema Supabase
 # ---------------------------------------------------------------------------
@@ -1125,7 +1341,8 @@ CREATE POLICY "Leitura publica de cargas_ongo" ON public.cargas_ongo FOR SELECT 
 # Supabase — sincronização de cargas_ongo (base para o dashboard M15)
 # ---------------------------------------------------------------------------
 
-def _upsert_cargas_ongo(fretes: list, valor_cache: dict, terminal_cache: dict) -> None:
+def _upsert_cargas_ongo(fretes: list, valor_cache: dict, terminal_cache: dict, new_ids: set | None = None,
+                         first_seen_cache: dict | None = None) -> None:
     """Sincroniza os lotes ativos com a tabela cargas_ongo (upsert por link_id_carga).
 
     Nunca deve derrubar o ciclo do Sheets (fonte de verdade atual) — qualquer
@@ -1166,6 +1383,11 @@ def _upsert_cargas_ongo(fretes: list, valor_cache: dict, terminal_cache: dict) -
             "valor_proposto_ton": valor_cache.get(carga_id),
             "status":             STATUS_CARGA.get(status_code, str(status_code)),
             "atualizado_em":      data_captura_iso,
+            # Data em que a oferta apareceu no Ongo pela 1a vez (mesmo first_seen_cache
+            # que ja alimenta a coluna "Data Entrada Ongo" do Historico, ver M15/M9) -
+            # pedido do usuario 2026-07-08 pra analise tipo "liberou 13h dia X, carregou
+            # tudo no mesmo dia". Formato cru (dd/mm/aaaa hh:mm), mesmo do cache.
+            "data_entrada_ongo":  (first_seen_cache or {}).get(carga_id),
         })
 
     if not rows:
@@ -1174,9 +1396,160 @@ def _upsert_cargas_ongo(fretes: list, valor_cache: dict, terminal_cache: dict) -
     try:
         client = create_client(supabase_url, supabase_key)
         client.table("cargas_ongo").upsert(rows, on_conflict="link_id_carga").execute()
-        print(f"[LOG {_ts()}] Supabase: {len(rows)} lote(s) sincronizado(s) em cargas_ongo.")
+
+        # Remove lotes que sumiram da lista ativa do Ongo desde o ultimo ciclo -
+        # achado real 2026-07-08: upsert nunca apagava, entao lote fechado/expirado
+        # ficava fantasma pra sempre (Sheets tinha 128 linhas reais, Supabase tinha
+        # 248 acumuladas desde 02/07 - 120 fantasmas). Mesmo comportamento
+        # full-refresh que o Sheets ja tem (_write_ws faz ws.clear() a cada ciclo).
+        ids_ativos = [r["link_id_carga"] for r in rows]
+        del_resp = (
+            client.table("cargas_ongo")
+            .delete()
+            .not_.in_("link_id_carga", ids_ativos)
+            .execute()
+        )
+        n_removidos = len(del_resp.data or [])
+
+        print(f"[LOG {_ts()}] Supabase: {len(rows)} lote(s) sincronizado(s) em cargas_ongo"
+              f" ({n_removidos} fantasma(s) removido(s)).")
     except Exception as exc:
         print(f"[LOG {_ts()}] ERRO ao sincronizar cargas_ongo no Supabase: {exc}")
+        # Achado 2026-07-09: essa falha ficava só no log, sem alerta — a coluna
+        # data_entrada_ongo faltou ser migrada em produção e o sync ficou parado
+        # 1 dia inteiro sem ninguém perceber (Sheets seguia OK, Torre defasada).
+        alertar_falha("Ongo - sync cargas_ongo (Torre Ao Vivo)", str(exc))
+        return
+
+    # M27.1 — Cerebro Central: indexa só os lotes novos deste ciclo (lotes já
+    # conhecidos já têm fragmento de uma execução anterior). Origem usa
+    # municipio_origem (cidade real) e destino tem o código numérico removido —
+    # texto de rota legível pro embedding, sem alterar cargas_ongo em si.
+    if new_ids:
+        novos = [r for r in rows if r["link_id_carga"] in new_ids]
+        for row in novos:
+            origem_memoria = row.get("municipio_origem") or _strip_code_prefix(row.get("origem", ""))
+            destino_memoria = _strip_code_prefix(row.get("destino", ""))
+            indexar_memoria_sync(
+                fonte="ongo",
+                identificador_origem=row["link_id_carga"],
+                texto_resumo=f"Ongo {row.get('produto')}: {origem_memoria} para {destino_memoria} ({row.get('terminal_origem')})",
+                entidade_cliente=row.get("empresa") or "",
+            )
+        if novos:
+            print(f"[LOG {_ts()}] Cerebro Central: {len(novos)} fragmento(s) novo(s) indexado(s) em torre_memoria_global.")
+
+
+# ---------------------------------------------------------------------------
+# Supabase — M41: Ongo como fonte de liberacoes_ativas (Módulo Liberações & Aderência)
+# ---------------------------------------------------------------------------
+
+def _upsert_liberacoes_ativas(fretes: list, valor_cache: dict) -> None:
+    """Remapeia o Ongo pro schema consolidado liberacoes_ativas (M40/M41).
+
+    Não é uma captura nova — Ongo já flui via _upsert_cargas_ongo() (M15) — é
+    normalização pro formato único que /torre/liberacoes (M42) e o matcher por
+    ID (M43) vão consumir de todas as fontes (Ongo, BTG SMC, WhatsApp) da
+    mesma forma. Mesma política de "nunca derruba o ciclo" que
+    _upsert_cargas_ongo já segue — qualquer falha aqui só é logada.
+
+    Tabela só existe depois da migration M40 (backend/liberacoes_migration.sql)
+    ser aplicada manualmente pelo usuário no SQL Editor do Supabase — até lá,
+    a falha de "tabela não existe" é esperada e não deve gerar alerta.
+    """
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_SERVICE_KEY", "")
+    if not supabase_url or not supabase_key:
+        return  # já logado por _upsert_cargas_ongo() no mesmo ciclo
+
+    try:
+        from supabase import create_client
+    except ImportError:
+        return  # já logado por _upsert_cargas_ongo() no mesmo ciclo
+
+    atualizado_em_iso = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for item in fretes:
+        carga_id = str(item.get("idCotacao", ""))
+        if not carga_id:
+            continue
+        status_code = item.get("statusDaCarga", 0)
+        rows.append({
+            "fonte":                    "ongo",
+            "id_externo":               carga_id,
+            "cliente":                  item.get("donoDaCarga", ""),
+            "origem":                   item.get("origem", ""),
+            "destino":                  item.get("destino", ""),
+            "produto":                  item.get("produto", ""),
+            "volume_total_kg":          item.get("cargaTotal"),
+            "saldo_kg":                 item.get("pesoRestante"),
+            "valor_tonelada":           valor_cache.get(carga_id),
+            "status":                   STATUS_LIBERACAO.get(status_code, "liberado"),
+            "ultima_atualizacao_fonte": "ongo_scraper",
+            "atualizado_em":            atualizado_em_iso,
+        })
+
+    if not rows:
+        return
+
+    try:
+        client = create_client(supabase_url, supabase_key)
+
+        # Estado anterior a esta rodada (antes do upsert sobrescrever) — usado
+        # tanto pela reconciliação de órfãos quanto pelo M50 (só dispara a
+        # síntese de fechamento na transição liberado -> zerado/cancelado, uma
+        # única vez por lote, nunca a cada ciclo em que ele já está fechado).
+        anteriores = (
+            client.table("liberacoes_ativas")
+            .select("id_externo,status")
+            .eq("fonte", "ongo")
+            .execute()
+        ).data or []
+        status_anterior = {r["id_externo"]: r["status"] for r in anteriores}
+
+        client.table("liberacoes_ativas").upsert(rows, on_conflict="fonte,id_externo").execute()
+        print(f"[LOG {_ts()}] M41: {len(rows)} liberação(ões) sincronizada(s) em liberacoes_ativas.")
+
+        ids_atuais = {r["id_externo"] for r in rows}
+        fechados_agora = {
+            r["id_externo"] for r in rows
+            if r["status"] in ("zerado", "cancelado") and status_anterior.get(r["id_externo"]) == "liberado"
+        }
+
+        # Reconciliação (achado 2026-07-15): cargas que somem do pull atual do
+        # Ongo (concluídas/canceladas do lado de lá) ficavam presas pra sempre
+        # como "liberado" em liberacoes_ativas, porque o upsert só toca quem
+        # ainda está no feed. Isso divergia a tela /torre/liberacoes do card
+        # Frete Geral Ongo (167 vs 101 no dia do achado — 66 órfãos parados
+        # desde 10-13/07). Marca como "zerado" (oferta encerrada) quem estava
+        # "liberado" aqui mas não veio mais no pull de agora.
+        orfaos = [id_ for id_, st in status_anterior.items() if st == "liberado" and id_ not in ids_atuais]
+        if orfaos:
+            client.table("liberacoes_ativas").update({
+                "status":         "zerado",
+                "atualizado_em":  atualizado_em_iso,
+            }).eq("fonte", "ongo").in_("id_externo", orfaos).execute()
+            print(f"[LOG {_ts()}] M41: {len(orfaos)} liberação(ões) encerrada(s) no Ongo marcada(s) como zerado.")
+            fechados_agora.update(orfaos)
+
+        # M50 — fechamento de lote gera fato histórico + alimenta os 2 RAGs
+        # (historico_fechamentos/torre_memoria_global). Busca de novo do banco
+        # em vez de reaproveitar `rows` porque órfãos não estão em `rows`, e
+        # os dois caminhos (rows + órfãos) precisam dos campos de aderência do
+        # M44 (frete_motorista_ton etc.), que só existem em liberacoes_ativas.
+        if fechados_agora:
+            lotes_fechados = (
+                client.table("liberacoes_ativas")
+                .select("*")
+                .eq("fonte", "ongo")
+                .in_("id_externo", list(fechados_agora))
+                .execute()
+            ).data or []
+            for lote in lotes_fechados:
+                registrar_execucao_lote_sync(lote)
+            print(f"[LOG {_ts()}] M50: {len(lotes_fechados)} execução(ões) de lote registrada(s) (histórico + RAG).")
+    except Exception as exc:
+        print(f"[LOG {_ts()}] M41: liberacoes_ativas ainda indisponível (rode backend/liberacoes_migration.sql) — {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -1302,7 +1675,31 @@ def run_cycle(cycle: int, page, known_ids: set,
                     first_run=(cycle == 1))
 
     # 12b. Supabase — sincroniza cargas_ongo (base do dashboard M15)
-    _upsert_cargas_ongo(fretes, valor_cache, terminal_cache)
+    _upsert_cargas_ongo(fretes, valor_cache, terminal_cache, new_ids, first_seen_cache)
+
+    # 12b.2 — M41: mesma leitura (fretes/valor_cache), zero requisição extra ao
+    # Ongo, remapeando pro schema consolidado do Módulo Liberações & Aderência.
+    _upsert_liberacoes_ativas(fretes, valor_cache)
+
+    # 12c. M32/M34 — Valor pra Transportadora (FASE 10, manual/sob demanda por
+    # enquanto — decisão 2026-07-08, ver MILESTONES.md). Reaproveita api_headers
+    # já capturado no passo 1 (_fetch_lista).
+    try:
+        geolocations = _fetch_geolocations(page)
+        sem_localizacao = _detectar_sem_localizacao(geolocations)
+        sem_localizacao_rows = _map_sem_localizacao_rows(sem_localizacao, timestamp)
+        if sem_localizacao:
+            print(f"[LOG {_ts()}] M32: {len(sem_localizacao)} caminhão(ões) sem localização.")
+            alertar_sem_localizacao(sem_localizacao)
+
+        descarga_registros = _fetch_analise_descarga(page, api_headers)
+        descarga_rows = _map_descarga_rows(descarga_registros)
+        _upsert_descarregamentos(descarga_registros)
+        print(f"[LOG {_ts()}] M34: {len(descarga_rows)} linha(s) de descarregamento.")
+
+        _push_valor_transportadora_sheets(sem_localizacao_rows, descarga_rows)
+    except Exception as exc:
+        print(f"[LOG {_ts()}] ERRO no bloco M32/M34 (não derruba o ciclo principal): {exc}")
 
     # 13. Webhook
     if WEBHOOK_URL:
@@ -1380,18 +1777,25 @@ def main() -> None:
                 break
 
             except RuntimeError as exc:
-                print(f"[LOG {_ts()}] {exc} — tentando re-login...")
+                print(f"[LOG {_ts()}] {exc} — aguardando 20s antes de tentar re-login...")
+                # Pausa deliberada antes de relogar — sessao expirada seguida de re-login
+                # IMEDIATO e o mesmo padrao (login logo apos outro) que causou fricção real
+                # observada em 2026-07-08 (ver MILESTONES.md M38). Nao elimina o risco, so
+                # evita empilhar tentativas rapidas sem necessidade.
+                time.sleep(20)
                 try:
                     _login(page)
                     print(f"[LOG {_ts()}] Re-login OK.")
                 except Exception as login_exc:
                     print(f"[LOG {_ts()}] Falha no re-login: {login_exc}.")
+                    alertar_falha("Ongo - monitor continuo (re-login)", str(login_exc))
 
             except Exception as exc:
                 print(
                     f"[LOG {_ts()}] ERRO na varredura #{cycle}: {exc}. "
                     f"Próxima tentativa em {POLL_INTERVAL // 60} min..."
                 )
+                alertar_falha(f"Ongo - monitor continuo (varredura #{cycle})", str(exc))
 
             try:
                 time.sleep(POLL_INTERVAL)
